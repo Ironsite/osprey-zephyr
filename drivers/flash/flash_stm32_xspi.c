@@ -304,9 +304,16 @@ static int stm32_xspi_read_sfdp(const struct device *dev, off_t addr,
 	const struct flash_stm32_xspi_config *dev_cfg = dev->config;
 	struct flash_stm32_xspi_data *dev_data = dev->data;
 
-	XSPI_RegularCmdTypeDef cmd = xspi_prepare_cmd(dev_cfg->data_mode,
-						      dev_cfg->data_rate);
-	if (dev_cfg->data_mode == XSPI_OCTO_MODE) {
+	/*
+	 * SFDP is read before the part is switched to OPI (see the init
+	 * sequence), so the command has to match the mode the memory is
+	 * actually in right now, not the mode it will end up in.
+	 */
+	XSPI_RegularCmdTypeDef cmd =
+		dev_data->sfdp_force_spi
+			? xspi_prepare_cmd(XSPI_SPI_MODE, XSPI_STR_TRANSFER)
+			: xspi_prepare_cmd(dev_cfg->data_mode, dev_cfg->data_rate);
+	if (!dev_data->sfdp_force_spi && dev_cfg->data_mode == XSPI_OCTO_MODE) {
 		cmd.Instruction = JESD216_OCMD_READ_SFDP;
 		cmd.DummyCycles = 20U;
 		cmd.AddressWidth = HAL_XSPI_ADDRESS_32_BITS;
@@ -581,6 +588,13 @@ static int xspi_write_unprotect(const struct device *dev)
 }
 
 /* Write Flash configuration register 2 with new dummy cycles */
+#ifndef CONFIG_FLASH_STM32_XSPI_OPI_MICRON
+/* Macronix-only, and so is its single call site below: a Micron-convention
+ * part keeps its dummy cycle count in the volatile configuration register,
+ * not in configuration register 2 address 3. Guarded rather than left
+ * unconditional so an OPI_MICRON build does not carry it as dead code
+ * (-Wunused-function).
+ */
 static int stm32_xspi_write_cfg2reg_dummy(const struct device *dev,
 					uint8_t nor_mode, uint8_t nor_rate)
 {
@@ -619,6 +633,7 @@ static int stm32_xspi_write_cfg2reg_dummy(const struct device *dev,
 
 	return 0;
 }
+#endif /* !CONFIG_FLASH_STM32_XSPI_OPI_MICRON */
 
 /* Write Flash configuration register 2 with new single or octal SPI protocol */
 static int stm32_xspi_write_cfg2reg_io(XSPI_HandleTypeDef *hxspi,
@@ -627,13 +642,33 @@ static int stm32_xspi_write_cfg2reg_io(XSPI_HandleTypeDef *hxspi,
 	XSPI_RegularCmdTypeDef s_command = xspi_prepare_cmd(nor_mode, nor_rate);
 
 	/* Initialize the writing of configuration register 2 */
+#ifdef CONFIG_FLASH_STM32_XSPI_OPI_MICRON
+	/* Micron/ISSI xSPI parts arm octal mode through the volatile
+	 * configuration register (0x81) rather than Macronix's CFG2 (0x72).
+	 */
+	s_command.Instruction = SPI_NOR_CMD_WR_VCFGREG;
+#else
 	s_command.Instruction = (nor_mode == XSPI_SPI_MODE)
 				? SPI_NOR_CMD_WR_CFGREG2
 				: SPI_NOR_OCMD_WR_CFGREG2;
+#endif
 	s_command.Address = SPI_NOR_REG2_ADDR1;
 	s_command.DummyCycles = 0U;
 	s_command.DataLength = (nor_mode == XSPI_SPI_MODE) ? 1U
 		: ((nor_rate == XSPI_DTR_TRANSFER) ? 2U : 1U);
+#ifdef CONFIG_FLASH_STM32_XSPI_OPI_MICRON
+	/*
+	 * The volatile configuration register is addressed with the main array
+	 * address scheme, and these parts power up in 3-byte address mode
+	 * (VCR 05h = ffh). xspi_prepare_cmd() hardcodes a 32-bit address for
+	 * the whole init phase, so without this the mode byte is written one
+	 * byte off and octal never engages -- silently, because the part just
+	 * ignores it.
+	 */
+	if (nor_mode == XSPI_SPI_MODE) {
+		s_command.AddressWidth = HAL_XSPI_ADDRESS_24_BITS;
+	}
+#endif
 
 	if (HAL_XSPI_Command(hxspi, &s_command,
 		HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
@@ -704,7 +739,12 @@ static int stm32_xspi_config_mem(const struct device *dev)
 		return -EIO;
 	}
 
-	/* Write Configuration register 2 (with new dummy cycles) */
+#ifndef CONFIG_FLASH_STM32_XSPI_OPI_MICRON
+	/* Macronix-only: configuration register 2 address 3 holds the dummy
+	 * cycle count. A Micron-convention part keeps dummy cycles in its
+	 * volatile configuration register instead, so this write would land on
+	 * an unrelated address -- skip it and keep the part's default.
+	 */
 	if (stm32_xspi_write_cfg2reg_dummy(dev,
 		XSPI_SPI_MODE, XSPI_STR_TRANSFER) != 0) {
 		LOG_ERR("XSPI write CFGR2 failed");
@@ -720,11 +760,17 @@ static int stm32_xspi_config_mem(const struct device *dev)
 		LOG_ERR("XSPI write Enable 2 failed");
 		return -EIO;
 	}
+#endif
 
 	/* Write Configuration register 2 (with Octal I/O SPI protocol : choose STR or DTR) */
+#ifdef CONFIG_FLASH_STM32_XSPI_OPI_MICRON
+	/* Value taken from the part's own SFDP table 0xff0a. */
+	uint8_t mode_enable = SPI_NOR_VCR_OPI_EN;
+#else
 	uint8_t mode_enable = ((dev_cfg->data_rate == XSPI_DTR_TRANSFER)
 				? SPI_NOR_CR2_DTR_OPI_EN
 				: SPI_NOR_CR2_STR_OPI_EN);
+#endif
 	if (stm32_xspi_write_cfg2reg_io(&dev_data->hxspi,
 		XSPI_SPI_MODE, XSPI_STR_TRANSFER, mode_enable) != 0) {
 		LOG_ERR("XSPI write CFGR2 failed");
@@ -735,10 +781,10 @@ static int stm32_xspi_config_mem(const struct device *dev)
 	k_busy_wait(STM32_XSPI_WRITE_REG_MAX_TIME * USEC_PER_MSEC);
 
 	/* Reconfigure the memory type of the peripheral */
-	dev_data->hxspi.Init.MemoryType            = HAL_XSPI_MEMTYPE_MACRONIX;
-	dev_data->hxspi.Init.DelayHoldQuarterCycle = HAL_XSPI_DHQC_ENABLE;
+	dev_data->hxspi.Init.MemoryType            = HAL_XSPI_MEMTYPE_MICRON;
+	dev_data->hxspi.Init.DelayHoldQuarterCycle = HAL_XSPI_DHQC_DISABLE;
 	if (HAL_XSPI_Init(&dev_data->hxspi) != HAL_OK) {
-		LOG_ERR("XSPI mem type MACRONIX failed");
+		LOG_ERR("XSPI mem type config failed");
 		return -EIO;
 	}
 
@@ -782,6 +828,13 @@ static int stm32_xspi_config_mem(const struct device *dev)
 }
 
 /* gpio or send the different reset command to the NOR flash in SPI/OSPI and STR/DTR */
+/* Bound on a single reset probe. These commands carry no address and no data
+ * phase, so a timeout here means the peripheral is wedged rather than the part
+ * being slow -- and with three modes to try, the 5 s HAL default would cost 15 s
+ * of boot time whenever the memory is in the wrong mode.
+ */
+#define STM32_XSPI_RESET_CMD_TIMEOUT 500U
+
 static int stm32_xspi_mem_reset(const struct device *dev)
 {
 	struct flash_stm32_xspi_data *dev_data = dev->data;
@@ -812,54 +865,56 @@ static int stm32_xspi_mem_reset(const struct device *dev)
 #endif /* XSPI_CCR_SIOO */
 	};
 
-	/* Reset enable in SPI mode and STR transfer mode */
-	if (HAL_XSPI_Command(&dev_data->hxspi,
-		&s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI reset enable (SPI/STR) failed");
-		return -EIO;
+	/* The memory may have been left in OPI mode by a previous user -- an
+	 * external loader, or firmware that switched the part -- in which case the
+	 * SPI/STR opcodes are not understood and HAL_XSPI_Command() times out.
+	 * Try every mode rather than giving up on the first failure, aborting in
+	 * between so a wedged transfer does not poison the next attempt.
+	 */
+	static const struct {
+		const char *name;
+		uint32_t inst_mode;
+		uint32_t inst_dtr;
+		uint32_t inst_width;
+		uint32_t reset_en;
+		uint32_t reset_mem;
+	} reset_modes[] = {
+		{ "SPI/STR", HAL_XSPI_INSTRUCTION_1_LINE, HAL_XSPI_INSTRUCTION_DTR_DISABLE,
+		  HAL_XSPI_INSTRUCTION_8_BITS, SPI_NOR_CMD_RESET_EN, SPI_NOR_CMD_RESET_MEM },
+		{ "OCTO/STR", HAL_XSPI_INSTRUCTION_8_LINES, HAL_XSPI_INSTRUCTION_DTR_DISABLE,
+		  HAL_XSPI_INSTRUCTION_16_BITS, SPI_NOR_OCMD_RESET_EN, SPI_NOR_OCMD_RESET_MEM },
+		{ "OCTO/DTR", HAL_XSPI_INSTRUCTION_8_LINES, HAL_XSPI_INSTRUCTION_DTR_ENABLE,
+		  HAL_XSPI_INSTRUCTION_16_BITS, SPI_NOR_OCMD_RESET_EN, SPI_NOR_OCMD_RESET_MEM },
+	};
+	bool reset_done = false;
+
+	for (size_t i = 0; i < ARRAY_SIZE(reset_modes); i++) {
+		s_command.InstructionMode = reset_modes[i].inst_mode;
+		s_command.InstructionDTRMode = reset_modes[i].inst_dtr;
+		s_command.InstructionWidth = reset_modes[i].inst_width;
+
+		s_command.Instruction = reset_modes[i].reset_en;
+		if (HAL_XSPI_Command(&dev_data->hxspi, &s_command,
+			STM32_XSPI_RESET_CMD_TIMEOUT) != HAL_OK) {
+			LOG_DBG("XSPI reset enable (%s) not accepted", reset_modes[i].name);
+			(void)HAL_XSPI_Abort(&dev_data->hxspi);
+			continue;
+		}
+
+		s_command.Instruction = reset_modes[i].reset_mem;
+		if (HAL_XSPI_Command(&dev_data->hxspi, &s_command,
+			STM32_XSPI_RESET_CMD_TIMEOUT) != HAL_OK) {
+			LOG_DBG("XSPI reset memory (%s) not accepted", reset_modes[i].name);
+			(void)HAL_XSPI_Abort(&dev_data->hxspi);
+			continue;
+		}
+
+		LOG_DBG("XSPI reset accepted in %s mode", reset_modes[i].name);
+		reset_done = true;
 	}
 
-	/* Reset memory in SPI mode and STR transfer mode */
-	s_command.Instruction = SPI_NOR_CMD_RESET_MEM;
-	if (HAL_XSPI_Command(&dev_data->hxspi,
-		&s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI reset memory (SPI/STR) failed");
-		return -EIO;
-	}
-
-	/* Reset enable in OPI mode and STR transfer mode */
-	s_command.InstructionMode    = HAL_XSPI_INSTRUCTION_8_LINES;
-	s_command.InstructionDTRMode = HAL_XSPI_INSTRUCTION_DTR_DISABLE;
-	s_command.Instruction = SPI_NOR_OCMD_RESET_EN;
-	s_command.InstructionWidth = HAL_XSPI_INSTRUCTION_16_BITS;
-	if (HAL_XSPI_Command(&dev_data->hxspi,
-		&s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI reset enable (OCTO/STR) failed");
-		return -EIO;
-	}
-
-	/* Reset memory in OPI mode and STR transfer mode */
-	s_command.Instruction = SPI_NOR_OCMD_RESET_MEM;
-	if (HAL_XSPI_Command(&dev_data->hxspi,
-		&s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI reset memory (OCTO/STR) failed");
-		return -EIO;
-	}
-
-	/* Reset enable in OPI mode and DTR transfer mode */
-	s_command.InstructionDTRMode = HAL_XSPI_INSTRUCTION_DTR_ENABLE;
-	s_command.Instruction = SPI_NOR_OCMD_RESET_EN;
-	if (HAL_XSPI_Command(&dev_data->hxspi,
-		&s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI reset enable (OCTO/DTR) failed");
-		return -EIO;
-	}
-
-	/* Reset memory in OPI mode and DTR transfer mode */
-	s_command.Instruction = SPI_NOR_OCMD_RESET_MEM;
-	if (HAL_XSPI_Command(&dev_data->hxspi,
-		&s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-		LOG_ERR("XSPI reset memory (OCTO/DTR) failed");
+	if (!reset_done) {
+		LOG_ERR("XSPI reset rejected in every mode (SPI/STR, OCTO/STR, OCTO/DTR)");
 		return -EIO;
 	}
 
@@ -2188,8 +2243,12 @@ static int flash_stm32_xspi_init(const struct device *dev)
 #endif /* XSPI_DCR2_WRAPSIZE */
 	/* STR mode else Macronix for DTR mode */
 	if (dev_cfg->data_rate == XSPI_DTR_TRANSFER) {
-		dev_data->hxspi.Init.MemoryType = HAL_XSPI_MEMTYPE_MACRONIX;
-		dev_data->hxspi.Init.DelayHoldQuarterCycle = HAL_XSPI_DHQC_ENABLE;
+		/* Use MICRON mode for ISSI/standard xSPI flash (IS25WX256, etc.)
+		 * MACRONIX mode changes DQS sampling which breaks ISSI flash.
+		 * TODO: Make this configurable via DT property.
+		 */
+		dev_data->hxspi.Init.MemoryType = HAL_XSPI_MEMTYPE_MICRON;
+		dev_data->hxspi.Init.DelayHoldQuarterCycle = HAL_XSPI_DHQC_DISABLE;
 	}
 
 	if (stm32_xspi_is_memorymap(dev)) {
@@ -2310,11 +2369,21 @@ static int flash_stm32_xspi_init(const struct device *dev)
 	}
 #endif /* CONFIG_FLASH_JESD216_API */
 
-	if (stm32_xspi_config_mem(dev) != 0) {
-		LOG_ERR("OSPI mode not config'd (%u rate %u)",
-			dev_cfg->data_mode, dev_cfg->data_rate);
-		return -EIO;
-	}
+	/*
+	 * Read SFDP while the memory is still in 1-line SPI/STR, before the
+	 * switch to OPI below.
+	 *
+	 * Upstream did this the other way round -- switch to OPI first, then
+	 * read SFDP with the octal command. That works on the Macronix part
+	 * this driver was developed against, but an ISSI IS25WX256 returns all
+	 * zeroes to the octal SFDP read (at every dummy-cycle count from 8 to
+	 * 32), so the magic check fails and the whole device fails to
+	 * initialise -- even though its status and CFG2 registers read back
+	 * correctly over the same octal bus. Every part has to answer SFDP in
+	 * 1-line mode, so reading it here is both more portable and strictly
+	 * earlier than anything that depends on it.
+	 */
+	dev_data->sfdp_force_spi = true;
 
 	/* Send the instruction to read the SFDP  */
 	const uint8_t decl_nph = 2;
@@ -2340,6 +2409,49 @@ static int flash_stm32_xspi_init(const struct device *dev)
 
 	LOG_DBG("%s: SFDP v %u.%u AP %x with %u PH", dev->name,
 		hp->rev_major, hp->rev_minor, hp->access, 1 + hp->nph);
+
+#ifdef CONFIG_FLASH_STM32_XSPI_SFDP_DUMP
+	{
+		/* Re-read the header with room for every parameter header, not
+		 * just the two the BFP walk below needs.
+		 */
+		uint8_t rawhdr[8 + 8 * 8];
+		const struct jesd216_sfdp_header *dhp =
+			(const struct jesd216_sfdp_header *)rawhdr;
+
+		if (xspi_read_sfdp(dev, 0, rawhdr, sizeof(rawhdr)) == 0) {
+			unsigned int n = MIN(1U + dhp->nph, 8U);
+
+			printk("SFDP v%u.%u: %u parameter table(s)\n",
+			       dhp->rev_major, dhp->rev_minor, n);
+
+			for (unsigned int i = 0; i < n; i++) {
+				const struct jesd216_param_header *dph = &dhp->phdr[i];
+				uint16_t pid = jesd216_param_id(dph);
+				uint32_t paddr = jesd216_param_addr(dph);
+				uint32_t dw[20];
+				size_t ndw = MIN(dph->len_dw, ARRAY_SIZE(dw));
+
+				printk("  [%u] id %04x rev %u.%u %2u DW @ 0x%06x%s\n",
+				       i, pid, dph->rev_major, dph->rev_minor,
+				       dph->len_dw, paddr,
+				       (pid == JESD216_SFDP_PARAM_ID_XSPI_PROFILE_1V0)
+					       ? "  <-- xSPI Profile 1.0 (octal entry)"
+					       : "");
+
+				if (xspi_read_sfdp(dev, paddr, dw,
+						   ndw * sizeof(uint32_t)) != 0) {
+					printk("      (read failed)\n");
+					continue;
+				}
+				for (size_t j = 0; j < ndw; j++) {
+					printk("      DW%-2u 0x%08x\n",
+					       (unsigned int)(j + 1), dw[j]);
+				}
+			}
+		}
+	}
+#endif /* CONFIG_FLASH_STM32_XSPI_SFDP_DUMP */
 
 	const struct jesd216_param_header *php = hp->phdr;
 	const struct jesd216_param_header *phpe = php +
@@ -2406,6 +2518,22 @@ static int flash_stm32_xspi_init(const struct device *dev)
 		}
 		++php;
 	}
+
+	/*
+	 * Deliberately left set. SFDP is defined to be readable with the 1-line
+	 * command on every part, so keeping it here makes runtime
+	 * flash_sfdp_read() work regardless of the mode the array ends up in --
+	 * which is what lets the memperf suite dump the xSPI Profile table and
+	 * discover how this part wants to be put into octal mode. Clear it only
+	 * once the octal SFDP command is known good on the part in use.
+	 */
+
+	if (stm32_xspi_config_mem(dev) != 0) {
+		LOG_ERR("OSPI mode not config'd (%u rate %u)",
+			dev_cfg->data_mode, dev_cfg->data_rate);
+		return -EIO;
+	}
+
 
 #if defined(CONFIG_FLASH_PAGE_LAYOUT)
 	ret = setup_pages_layout(dev);

@@ -65,8 +65,11 @@ static int xspim_stm32_init(const struct device *dev)
 	XSPIM_CfgTypeDef xspi_mgr_cfg;
 
 	if (clock_control_on(clk, (clock_control_subsys_t)&cfg->pclken) != 0) {
+		LOG_ERR("XSPIM clock enable failed");
 		return -EIO;
 	}
+
+	LOG_DBG("XSPIM clock enabled, configuring ports");
 
 	xspi_mgr_cfg.nCSOverride = ncs_override[DT_INST_ENUM_IDX(0, ncs_override)];
 	xspi_mgr_cfg.Req2AckTime = DT_INST_PROP(0, req2ack_time);
@@ -89,9 +92,12 @@ static int xspim_stm32_init(const struct device *dev)
 
 		if (HAL_XSPIM_Config(&hxspi, &xspi_mgr_cfg,
 				     HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
-			LOG_ERR("XSPIM config failed for dev %p", controllers_io_map[i].base);
+			LOG_ERR("XSPIM config failed for dev %p port %d",
+				controllers_io_map[i].base, controllers_io_map[i].io_port);
 			return -EIO;
 		}
+		LOG_DBG("XSPIM port %d configured for dev %p",
+			controllers_io_map[i].io_port, controllers_io_map[i].base);
 	}
 
 	return 0;

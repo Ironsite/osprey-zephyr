@@ -278,18 +278,42 @@ static uint32_t get_sysclk_frequency(void)
 
 #if !defined(CONFIG_CPU_CORTEX_M4)
 
+/* ~5 s at the 64 MHz HSI boot clock; only ever reached on failure. */
+#define STM32_LSE_TIMEOUT_LOOPS 30000000U
+
+/*
+ * How many poll iterations the LSE start-up actually took, so a board can
+ * measure its margin against STM32_LSE_TIMEOUT_LOOPS instead of guessing. A
+ * cold crystal is far slower than a warm restart, so this is worth knowing.
+ * Equal to STM32_LSE_TIMEOUT_LOOPS means it timed out and LSE is NOT running.
+ */
+uint32_t stm32_lse_startup_loops;
+
 static int32_t prepare_regulator_voltage_scale(void)
 {
 	/* Make sure to put the CPU in highest Voltage scale during clock configuration */
 	/* Highest voltage is SCALE0 */
 #if defined(CONFIG_SOC_SERIES_STM32H7RSX)
+	/*
+	 * VOS0 is safe to use on STM32H7RS *provided* VCORE is actually being
+	 * supplied as the devicetree claims. If `power-supply` does not match
+	 * the board, hardware clamps VCORE to 1.0 V and VOSRDY never asserts
+	 * (RM0477 section 6.5), so bound the wait rather than spinning forever
+	 * before the console exists. A timeout here means the board comes up on
+	 * the low voltage scale, which is fine at HSI speeds and lets the
+	 * failure be reported instead of hanging the boot.
+	 */
 	LL_PWR_SetRegulVoltageScaling(LL_PWR_REGU_VOLTAGE_SCALE0);
-	while (LL_PWR_IsActiveFlag_VOSRDY() == 0) {
+	for (uint32_t i = 0; i < 20000U; i++) {
+		if (LL_PWR_IsActiveFlag_VOSRDY() != 0) {
+			break;
+		}
+	}
 #else
 	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
 	while (LL_PWR_IsActiveFlag_VOS() == 0) {
-#endif
 	}
+#endif
 
 	return 0;
 }
@@ -306,11 +330,16 @@ static int32_t optimize_regulator_voltage_scale(uint32_t sysclk_freq)
 	/* See RM0433 page 352 for more details */
 	LL_PWR_SetRegulVoltageScaling(LL_PWR_REGU_VOLTAGE_SCALE0);
 #if defined(CONFIG_SOC_SERIES_STM32H7RSX)
-	while (LL_PWR_IsActiveFlag_VOSRDY() == 0) {
+	/* Bounded: see prepare_regulator_voltage_scale() above. */
+	for (uint32_t i = 0; i < 20000U; i++) {
+		if (LL_PWR_IsActiveFlag_VOSRDY() != 0) {
+			break;
+		}
+	}
 #else
 	while (LL_PWR_IsActiveFlag_VOS() == 0) {
+	}
 #endif
-	};
 
 	return 0;
 }
@@ -825,19 +854,55 @@ static void set_up_fixed_clock_sources(void)
 	}
 
 	if (IS_ENABLED(STM32_LSE_ENABLED)) {
+		uint32_t want_drv = STM32_LSE_DRIVING << RCC_BDCR_LSEDRV_Pos;
+
 		stm32_backup_domain_enable_access();
 
-		/* Configure driving capability */
-		LL_RCC_LSE_SetDriveCapability(STM32_LSE_DRIVING << RCC_BDCR_LSEDRV_Pos);
+		/*
+		 * RM0477 (RCC, LSE): "It is not allowed to change the driving
+		 * capability when the LSE is enabled. The LSE behavior is not
+		 * guaranteed in that case."
+		 */
+		/*
+		 * Restart LSE unless it is already running exactly as configured.
+		 * Two reasons, both invisible without this:
+		 *   - LSEDRV may only be written with LSE stopped (above).
+		 *   - LSEON survives a system reset, so LSE can arrive here already
+		 *     enabled but *stalled* (LSEON=1, LSERDY never asserts) from an
+		 *     earlier boot that wrote LSEDRV into a running oscillator.
+		 *     Calling LL_RCC_LSE_Enable() on it is a no-op; only a stop/start
+		 *     restarts it. Without this the boot hangs below forever.
+		 */
+		if ((RCC->BDCR & RCC_BDCR_LSEDRV) != want_drv ||
+		    LL_RCC_LSE_IsReady() == 0) {
+			LL_RCC_LSE_Disable();
+			for (uint32_t i = 0; i < STM32_LSE_TIMEOUT_LOOPS; i++) {
+				if (LL_RCC_LSE_IsReady() == 0) {
+					break;
+				}
+			}
+			LL_RCC_LSE_SetDriveCapability(want_drv);
 
-		if (IS_ENABLED(STM32_LSE_BYPASS)) {
-			/* Configure LSE bypass */
-			LL_RCC_LSE_EnableBypass();
+			if (IS_ENABLED(STM32_LSE_BYPASS)) {
+				/* Configure LSE bypass */
+				LL_RCC_LSE_EnableBypass();
+			}
 		}
 
 		/* Enable LSE oscillator */
 		LL_RCC_LSE_Enable();
-		while (LL_RCC_LSE_IsReady() != 1) {
+		/*
+		 * Bounded, and generously: a 32.768 kHz crystal needs hundreds of
+		 * ms to start (measured 646 ms at LSEDRV=00, 192 ms at 10 on the
+		 * Osprey Dock), and RM0477 adds 4096 LSE cycles (125 ms) before
+		 * LSERDY asserts. An unbounded wait here turns a dead crystal into
+		 * a silent hang before the console exists.
+		 */
+		for (uint32_t i = 0; i < STM32_LSE_TIMEOUT_LOOPS; i++) {
+			stm32_lse_startup_loops = i;
+			if (LL_RCC_LSE_IsReady() == 1) {
+				break;
+			}
 		}
 
 		stm32_backup_domain_disable_access();

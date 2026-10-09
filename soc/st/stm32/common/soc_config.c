@@ -79,6 +79,17 @@ static int st_stm32_common_config(void)
 #elif defined(CONFIG_SOC_SERIES_STM32H7X)
 	LL_DBGMCU_EnableD1DebugInStopMode();
 	LL_DBGMCU_EnableD1DebugInSleepMode();
+#elif defined(CONFIG_SOC_SERIES_STM32H7RSX)
+	/*
+	 * H7RS has the plain DBG_SLEEP/DBG_STOP/DBG_STANDBY bits (not the D1
+	 * domain variants of the H7). Sleep matters most here: k_cpu_idle()
+	 * issues a bare WFI, and without DBG_SLEEP the debug port stops
+	 * responding the moment the application goes idle -- which reads as a
+	 * crashed board, and breaks RTT and RAM-console-over-SWD.
+	 */
+	LL_DBGMCU_EnableDBGSleepMode();
+	LL_DBGMCU_EnableDBGStopMode();
+	LL_DBGMCU_EnableDBGStandbyMode();
 #elif defined(CONFIG_SOC_SERIES_STM32MP1X)
 	LL_DBGMCU_EnableDebugInStopMode();
 #elif defined(CONFIG_SOC_SERIES_STM32WB0X)

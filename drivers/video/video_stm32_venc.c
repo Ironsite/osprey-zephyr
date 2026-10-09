@@ -34,9 +34,9 @@ LOG_MODULE_REGISTER(stm32_venc, CONFIG_VIDEO_LOG_LEVEL);
 #define VENC_DEFAULT_HEIGHT              240
 #define VENC_DEFAULT_IN_FMT              VIDEO_PIX_FMT_NV12
 #define VENC_DEFAULT_OUT_FMT             VIDEO_PIX_FMT_H264
-#define VENC_DEFAULT_FRAMERATE           30
+#define VENC_DEFAULT_FRAMERATE           CONFIG_VIDEO_STM32_VENC_FRAMERATE
 #define VENC_DEFAULT_LEVEL               H264ENC_LEVEL_4
-#define VENC_DEFAULT_QP                  25
+#define VENC_DEFAULT_QP                  CONFIG_VIDEO_STM32_VENC_QP
 #define VENC_ESTIMATED_COMPRESSION_RATIO 10
 
 #define ALIGNMENT_INCR 8UL
@@ -234,27 +234,62 @@ i32 EWLMallocLinear(const void *instance, uint32_t size, EWLLinearMem_t *info)
 
 	/* align size */
 	uint32_t size_aligned = ROUND_UP(size, ALIGNMENT_INCR);
+	uint32_t slot;
+
+	/*
+	 * FIND A FREE SLOT, rather than appending at total_chunks.
+	 *
+	 * total_chunks used to be a monotonically increasing index that nothing
+	 * ever decremented -- EWLFreeLinear released the memory but left the
+	 * slot occupied and the counter untouched. The array is MEM_CHUNKS (32)
+	 * entries and there was no bounds check, so once the encoder had been
+	 * torn down and rebuilt enough times the index walked off the end and
+	 * chunks[total_chunks] wrote a heap pointer into whatever followed
+	 * ewl_instance. The k_heap then traversed a corrupted pointer and the
+	 * board took an imprecise bus fault inside alloc_chunk().
+	 *
+	 * MEASURED: reproducible at a fixed address after a fixed number of
+	 * encoder lifecycles from a clean flash, which is what gave it away --
+	 * a random corruption would not land on the same address twice.
+	 *
+	 * Encoder rebuilds are not rare: every H264EncInit / H264EncRelease pair
+	 * cycles the whole pool, and the error-recovery path deliberately rebuilds
+	 * after any encode failure.
+	 */
+	for (slot = 0; slot < MEM_CHUNKS; slot++) {
+		if (inst->chunks[slot] == NULL) {
+			break;
+		}
+	}
+	if (slot >= MEM_CHUNKS) {
+		LOG_ERR("all %d linear chunk slots in use, cannot allocate %d bytes",
+			MEM_CHUNKS, size_aligned);
+		return EWL_ERROR;
+	}
 
 	info->size = size_aligned;
 
 	/* allocate */
-	inst->chunks[inst->total_chunks] = (uint32_t *)EWL_HEAP_ALIGNED_ALLOC(size_aligned);
-	if (inst->chunks[inst->total_chunks] == NULL) {
+	inst->chunks[slot] = (uint32_t *)EWL_HEAP_ALIGNED_ALLOC(size_aligned);
+	if (inst->chunks[slot] == NULL) {
 		LOG_DBG("unable to allocate %8d bytes", size_aligned);
 		return EWL_ERROR;
 	}
 
 	/* align given allocated buffer */
-	inst->aligned_chunks[inst->total_chunks] =
-		(uint32_t *)ROUND_UP((uint32_t)inst->chunks[inst->total_chunks], ALIGNMENT_INCR);
+	inst->aligned_chunks[slot] =
+		(uint32_t *)ROUND_UP((uint32_t)inst->chunks[slot], ALIGNMENT_INCR);
 	/* put the aligned pointer in the return structure */
-	info->virtualAddress = inst->aligned_chunks[inst->total_chunks];
+	info->virtualAddress = inst->aligned_chunks[slot];
 	if (info->virtualAddress == NULL) {
 		LOG_DBG("unable to get chunk for %8d bytes", size_aligned);
-		EWL_HEAP_ALIGNED_FREE(inst->chunks[inst->total_chunks]);
+		EWL_HEAP_ALIGNED_FREE(inst->chunks[slot]);
+		inst->chunks[slot] = NULL;
 		return EWL_ERROR;
 	}
-	inst->total_chunks++;
+	if (slot >= inst->total_chunks) {
+		inst->total_chunks = slot + 1;
+	}
 
 	/* bus address is the same as virtual address because no MMU */
 	info->busAddress = (ptr_t)info->virtualAddress;
@@ -273,13 +308,24 @@ void EWLFreeLinear(const void *instance, EWLLinearMem_t *info)
 	__ASSERT_NO_MSG(inst != NULL);
 	__ASSERT_NO_MSG(info != NULL);
 
-	/* find the pointer corresponding to the aligned buffer */
-	for (uint32_t i = 0; i < inst->total_chunks; i++) {
-		if (inst->aligned_chunks[i] == info->virtualAddress) {
-			if (inst->chunks[i] != NULL) {
+	/*
+	 * Find the slot for this buffer, free it, and MARK THE SLOT FREE.
+	 *
+	 * Clearing both entries is what makes the slot reusable, and it also
+	 * closes a double-free: a stale aligned_chunks[i] left behind after a
+	 * free could match a later virtualAddress and release memory that by
+	 * then belonged to someone else. Scanning all MEM_CHUNKS rather than
+	 * total_chunks matters now that slots are reused out of order.
+	 */
+	if (info->virtualAddress != NULL) {
+		for (uint32_t i = 0; i < MEM_CHUNKS; i++) {
+			if (inst->chunks[i] != NULL &&
+			    inst->aligned_chunks[i] == info->virtualAddress) {
 				EWL_HEAP_ALIGNED_FREE(inst->chunks[i]);
+				inst->chunks[i] = NULL;
+				inst->aligned_chunks[i] = NULL;
+				break;
 			}
-			break;
 		}
 	}
 	info->virtualAddress = NULL;
@@ -500,6 +546,21 @@ static int encoder_prepare(struct stm32_venc_data *data)
 		return -EIO;
 	}
 
+	/*
+	 * High-profile 8x8 transform and CABAC.
+	 *
+	 * Both were previously left at whatever H264EncGetCodingCtrl returned,
+	 * because this function fetched the struct and set it straight back
+	 * unmodified. transform8x8Mode defaults off, which pins the stream to
+	 * Main profile and gives up the single biggest coding-efficiency feature
+	 * available here: the 8x8 transform preserves fine detail markedly better
+	 * at a given bitrate, which is exactly what a downscaled 5 MP frame needs.
+	 * idrHeader repeats SPS/PPS on every IDR so a decoder can join mid-stream.
+	 */
+	codingctrl_cfg.transform8x8Mode = CONFIG_VIDEO_STM32_VENC_TRANSFORM_8X8;
+	codingctrl_cfg.enableCabac = CONFIG_VIDEO_STM32_VENC_CABAC;
+	codingctrl_cfg.idrHeader = 1;
+
 	h264ret = H264EncSetCodingCtrl(data->encoder, &codingctrl_cfg);
 	if (h264ret != H264ENC_OK) {
 		LOG_ERR("H264EncSetCodingCtrl error=%d", h264ret);
@@ -513,14 +574,37 @@ static int encoder_prepare(struct stm32_venc_data *data)
 		return -EIO;
 	}
 
-	/* Constant bitrate */
-	ratectrl_cfg.pictureRc = 0;
-	ratectrl_cfg.mbRc = 0;
 	ratectrl_cfg.pictureSkip = 0;
 	ratectrl_cfg.hrd = 0;
-	ratectrl_cfg.qpHdr = VENC_DEFAULT_QP;
-	ratectrl_cfg.qpMin = ratectrl_cfg.qpHdr;
-	ratectrl_cfg.qpMax = ratectrl_cfg.qpHdr;
+
+	if (CONFIG_VIDEO_STM32_VENC_BITRATE > 0) {
+		/*
+		 * Variable bitrate against a target.
+		 *
+		 * bitPerSecond is interpreted RELATIVE TO cfg.frameRateNum, so
+		 * the framerate above has to be the real capture rate or the
+		 * per-picture bit budget is wrong by exactly that ratio.
+		 *
+		 * qpMin/qpMax bound what the controller may do: leaving qpMax at
+		 * 51 lets it dump quality to hold the bitrate on a hard scene,
+		 * while qpMin stops it wasting bits on an easy one.
+		 */
+		ratectrl_cfg.pictureRc = 1;
+		ratectrl_cfg.mbRc = 1;
+		ratectrl_cfg.bitPerSecond = CONFIG_VIDEO_STM32_VENC_BITRATE;
+		ratectrl_cfg.qpHdr = CONFIG_VIDEO_STM32_VENC_QP;
+		ratectrl_cfg.qpMin = CONFIG_VIDEO_STM32_VENC_QP_MIN;
+		ratectrl_cfg.qpMax = CONFIG_VIDEO_STM32_VENC_QP_MAX;
+		ratectrl_cfg.gopLen = CONFIG_VIDEO_STM32_VENC_GOP_LEN;
+		ratectrl_cfg.intraQpDelta = CONFIG_VIDEO_STM32_VENC_INTRA_QP_DELTA;
+	} else {
+		/* Constant QP, the original behaviour. */
+		ratectrl_cfg.pictureRc = 0;
+		ratectrl_cfg.mbRc = 0;
+		ratectrl_cfg.qpHdr = CONFIG_VIDEO_STM32_VENC_QP;
+		ratectrl_cfg.qpMin = ratectrl_cfg.qpHdr;
+		ratectrl_cfg.qpMax = ratectrl_cfg.qpHdr;
+	}
 
 	h264ret = H264EncSetRateCtrl(data->encoder, &ratectrl_cfg);
 	if (h264ret != H264ENC_OK) {
@@ -605,8 +689,17 @@ static int encode_frame(struct stm32_venc_data *data)
 		goto out;
 	}
 
-	/* one key frame every VENC_DEFAULT_FRAMERATE frames */
-	if ((data->frame_nb % VENC_DEFAULT_FRAMERATE) == 0 || data->resync) {
+	/*
+	 * One key frame per GOP.
+	 *
+	 * This used to be modulo VENC_DEFAULT_FRAMERATE, i.e. "one intra per
+	 * second of video" -- which is only true if the encoder's framerate
+	 * matches the real capture rate, and it disagreed with gopLen once rate
+	 * control was configured. The rate controller budgets bits per GOP, so
+	 * driving intra placement from a different number makes it consistently
+	 * mispredict. Use the one value that means "distance between intras".
+	 */
+	if ((data->frame_nb % CONFIG_VIDEO_STM32_VENC_GOP_LEN) == 0 || data->resync) {
 		/* if frame is the first or resync needed: set as intra coded */
 		enc_in.codingType = H264ENC_INTRA_FRAME;
 		data->resync = false;
@@ -645,28 +738,40 @@ static int encode_frame(struct stm32_venc_data *data)
 		}
 		output->bytesused = enc_out.streamSize;
 		break;
+	/*
+	 * RECOVERY: tear the encoder down and let the NEXT enqueue rebuild it.
+	 *
+	 * Both arms used to call encoder_end() followed immediately by
+	 * encoder_start(). encoder_end() runs H264EncRelease() and sets
+	 * data->encoder = NULL, so encoder_start() then handed a NULL instance
+	 * to H264EncStrmStart() and got H264ENC_NULL_ARGUMENT (-2) every time.
+	 * The encoder never came back, and because encode_frame() returns -EIO
+	 * the caller sees every subsequent enqueue fail too.
+	 *
+	 * MEASURED: one H264ENC_OUTPUT_BUFFER_OVERFLOW (-8) on frame 0 wedged
+	 * the encoder permanently, with "H264EncStrmStart error=-2" repeating
+	 * for the rest of the run.
+	 *
+	 * encode_frame() already rebuilds from scratch when data->encoder is
+	 * NULL -- that is how the first frame works -- so leaving it NULL is
+	 * both the correct recovery and the one the code already implements.
+	 */
 	case H264ENC_FUSE_ERROR:
 		LOG_ERR("H264EncStrmEncode error=%d", h264ret);
-
 		LOG_ERR("DCMIPP and VENC desync at frame %d, restart the video", data->frame_nb);
 		encoder_end(data);
-
-		ret = encoder_start(data, output);
-		if (ret) {
-			goto out;
-		}
+		data->resync = true;
 		break;
 	default:
 		LOG_ERR("H264EncStrmEncode error=%d", h264ret);
 		LOG_ERR("error encoding frame %d", data->frame_nb);
-
-		encoder_end(data);
-
-		ret = encoder_start(data, output);
-		if (ret) {
-			goto out;
+		if (h264ret == H264ENC_OUTPUT_BUFFER_OVERFLOW) {
+			LOG_ERR("output buffer of %d bytes too small for this picture; "
+				"an intra frame at a low QP is the worst case",
+				output->size);
 		}
 
+		encoder_end(data);
 		data->resync = true;
 
 		ret = -EIO;

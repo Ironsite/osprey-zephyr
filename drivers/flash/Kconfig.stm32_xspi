@@ -34,3 +34,29 @@ config FLASH_STM32_XSPI_DMA
 	  Enable the DMA mode for XSPI flash driver instance
 
 endif # FLASH_STM32_XSPI
+
+config FLASH_STM32_XSPI_SFDP_DUMP
+	bool "Dump the SFDP parameter tables at init"
+	depends on FLASH_STM32_XSPI
+	help
+	  Print every SFDP parameter header the memory publishes, and the raw
+	  dwords of each table, while the part is still in 1-line SPI mode.
+	  Bring-up aid: the xSPI Profile 1.0 table (id 0xff05) describes how a
+	  part wants to be put into octal mode, which this driver otherwise
+	  hardcodes to the Macronix convention. SFDP cannot be read once the
+	  peripheral is memory-mapped, so this has to happen at init.
+
+config FLASH_STM32_XSPI_OPI_MICRON
+	bool "Enter octal mode using the Micron/ISSI convention"
+	depends on FLASH_STM32_XSPI
+	help
+	  This driver enables octal mode the Macronix way: write configuration
+	  register 2 (opcode 0x72) at address 0 with 0x01 (STR) or 0x02 (DTR).
+	  Micron-convention xSPI parts, which include the ISSI IS25WX series,
+	  instead write the volatile configuration register (opcode 0x81) at
+	  address 0 with 0xe7.
+
+	  Say y for an ISSI IS25WX256. The values here are exactly what such a
+	  part publishes in its own SFDP "Command Sequences to Change to Octal
+	  DDR mode" table (id 0xff0a); dump it with
+	  CONFIG_FLASH_STM32_XSPI_SFDP_DUMP to confirm for another part.

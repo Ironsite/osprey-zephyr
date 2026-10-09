@@ -94,6 +94,52 @@
 #define SPI_NOR_OCMD_RD_CFGREG2 0x718E  /* Octal Read configuration Register2 */
 #define SPI_NOR_OCMD_BULKE      0x609F  /* Octa Bulk Erase */
 
+#ifdef CONFIG_FLASH_STM32_XSPI_OPI_MICRON
+/*
+ * Micron/ISSI xSPI octal profile (IS25LX/WX256/128 datasheet, rev A14).
+ *
+ * Two differences from the Macronix values above, both of which silently
+ * produce zeroes rather than errors if left wrong:
+ *
+ *  - Command extension. In 8D-8D-8D these parts send "valid byte + REPEATED
+ *    byte" (datasheet 4.2), where Macronix sends the inverted byte. So RDSR is
+ *    0x0505 here and 0x05fa there.
+ *  - Dummy cycles. The array read needs 16 and register reads need 8, against
+ *    Macronix's 6 and 5. The datasheet is explicit that "insufficient dummy
+ *    clock cycles for the operating frequency causes the memory to read
+ *    incorrect data".
+ *
+ * 8D-8D-8D also uses 4-byte addressing only.
+ */
+#undef SPI_NOR_OCMD_SE
+#undef SPI_NOR_OCMD_CE
+#undef SPI_NOR_OCMD_RDSR
+#undef SPI_NOR_OCMD_DTR_RD
+#undef SPI_NOR_OCMD_RD
+#undef SPI_NOR_OCMD_PAGE_PRG
+#undef SPI_NOR_OCMD_WREN
+#undef SPI_NOR_OCMD_NOP
+#undef SPI_NOR_OCMD_RESET_EN
+#undef SPI_NOR_OCMD_RESET_MEM
+#undef SPI_NOR_OCMD_WR_CFGREG2
+#undef SPI_NOR_OCMD_RD_CFGREG2
+#undef SPI_NOR_OCMD_BULKE
+
+#define SPI_NOR_OCMD_SE         0x2121  /* 4-byte sector erase */
+#define SPI_NOR_OCMD_CE         0xC7C7  /* Chip erase */
+#define SPI_NOR_OCMD_RDSR       0x0505  /* Read status register */
+#define SPI_NOR_OCMD_DTR_RD     0xFDFD  /* DDR OCTAL I/O FAST READ (FDh) */
+#define SPI_NOR_OCMD_RD         0xCCCC  /* 4-BYTE OCTAL I/O FAST READ (CCh) */
+#define SPI_NOR_OCMD_PAGE_PRG   0x1212  /* 4-byte page program */
+#define SPI_NOR_OCMD_WREN       0x0606  /* Write enable */
+#define SPI_NOR_OCMD_NOP        0x0000  /* No operation */
+#define SPI_NOR_OCMD_RESET_EN   0x6666  /* Reset enable */
+#define SPI_NOR_OCMD_RESET_MEM  0x9999  /* Reset memory */
+#define SPI_NOR_OCMD_WR_CFGREG2 0x8181  /* Write volatile config register */
+#define SPI_NOR_OCMD_RD_CFGREG2 0x8585  /* Read volatile config register */
+#define SPI_NOR_OCMD_BULKE      0xC7C7  /* Bulk erase */
+#endif /* CONFIG_FLASH_STM32_XSPI_OPI_MICRON */
+
  /* Page, sector, and block size are standard, not configurable. */
 #define SPI_NOR_PAGE_SIZE      0x0100U
 #define SPI_NOR_SECTOR_SIZE    0x1000U
@@ -114,14 +160,30 @@
 
 /* Flash Dummy Cycles values */
 #define SPI_NOR_DUMMY_RD                8U
+#ifdef CONFIG_FLASH_STM32_XSPI_OPI_MICRON
+/* IS25LX/WX: 8-8-8 array reads take 16 dummy cycles (the VCR 01h default),
+ * register reads 8. See the command set table in the datasheet.
+ */
+#define SPI_NOR_DUMMY_RD_OCTAL          16U
+#define SPI_NOR_DUMMY_RD_OCTAL_DTR      16U
+#define SPI_NOR_DUMMY_REG_OCTAL         8U
+#define SPI_NOR_DUMMY_REG_OCTAL_DTR     8U
+#else
 #define SPI_NOR_DUMMY_RD_OCTAL          6U
 #define SPI_NOR_DUMMY_RD_OCTAL_DTR      6U
 #define SPI_NOR_DUMMY_REG_OCTAL         4U
 #define SPI_NOR_DUMMY_REG_OCTAL_DTR     5U
+#endif
 
 
 /* Memory registers address */
 #define SPI_NOR_REG2_ADDR1              0x0000000
+/* Micron/ISSI xSPI convention: octal mode is armed by writing the volatile
+ * configuration register, not Macronix's configuration register 2.
+ */
+#define SPI_NOR_CMD_WR_VCFGREG          0x81    /* Write volatile config register */
+#define SPI_NOR_VCR_OPI_EN              0xE7    /* Octal DDR (8D-8D-8D) */
+
 #define SPI_NOR_CR2_STR_OPI_EN          0x01
 #define SPI_NOR_CR2_DTR_OPI_EN          0x02
 #define SPI_NOR_REG2_ADDR3              0x00000300

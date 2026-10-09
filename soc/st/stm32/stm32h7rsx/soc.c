@@ -25,6 +25,13 @@
 /* Helper to simplify following #if chain */
 #define SELECTED_PSU(_x) DT_ENUM_HAS_VALUE(PWR_NODE, power_supply, _x)
 
+/*
+ * Bound for the PWR status-flag polls below. The core runs at 64 MHz (HSI) at
+ * this point, so this is a few milliseconds -- far longer
+ * than the regulator needs, short enough not to look like a hang.
+ */
+#define STM32H7RS_PWR_FLAG_TIMEOUT 20000U
+
 #if SELECTED_PSU(ldo)
 #define SELECTED_POWER_SUPPLY LL_PWR_LDO_SUPPLY
 #elif SELECTED_PSU(external_source)
@@ -53,8 +60,30 @@ void soc_early_init_hook(void)
 
 	/* Power Configuration */
 	LL_PWR_ConfigSupply(SELECTED_POWER_SUPPLY);
+
+	/*
+	 * RM0477 section 6.5: after the supply configuration is programmed the
+	 * system is in Run* mode, and "VOS can be changed only when ACTVOSRDY
+	 * is valid". Waiting for ACTVOSRDY here is mandatory; without it the
+	 * VOS write can be ignored and every later VOSRDY poll spins forever.
+	 *
+	 * Both waits are bounded: if the supply configuration does not match
+	 * the board, VCORE is clamped to 1.0 V by the overvoltage protection
+	 * and these flags never assert. Timing out leaves the board booting
+	 * (and debuggable) instead of deadlocked before the console exists.
+	 */
+	for (uint32_t i = 0; i < STM32H7RS_PWR_FLAG_TIMEOUT; i++) {
+		if (LL_PWR_IsActiveFlag_ACTVOSRDY() != 0) {
+			break;
+		}
+	}
+
 	LL_PWR_SetRegulVoltageScaling(LL_PWR_REGU_VOLTAGE_SCALE1);
-	while (LL_PWR_IsActiveFlag_VOSRDY() == 0) {
+
+	for (uint32_t i = 0; i < STM32H7RS_PWR_FLAG_TIMEOUT; i++) {
+		if (LL_PWR_IsActiveFlag_VOSRDY() != 0) {
+			break;
+		}
 	}
 
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(gpioo), okay) || DT_NODE_HAS_STATUS(DT_NODELABEL(gpiop), okay)

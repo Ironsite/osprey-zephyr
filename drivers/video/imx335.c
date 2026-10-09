@@ -701,11 +701,11 @@ static int imx335_init(const struct device *dev)
 			return ret;
 		}
 
-		k_sleep(K_NSEC(500)); /* Tlow */
+		k_sleep(K_MSEC(1)); /* Tlow — hold reset asserted */
 
 		gpio_pin_set_dt(&cfg->reset_gpio, 0);
 
-		k_sleep(K_USEC(600)); /* T4 */
+		k_sleep(K_MSEC(20)); /* T4 — wait for sensor internal PLL/I2C ready */
 	}
 #endif
 

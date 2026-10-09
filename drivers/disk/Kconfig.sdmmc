@@ -64,6 +64,14 @@ config SDMMC_STM32_EMMC
 	help
 	  Use eMMC instead of SDIO (SD card) protocol. These are similar, but not entirely the same.
 
+config SDMMC_STM32_HS200
+	bool "STM32 SDMMC eMMC HS200 mode"
+	depends on SDMMC_STM32_EMMC
+	help
+	  Enable HS200 high-speed mode for eMMC (up to 200 MHz SDR).
+	  Requires 1.8V I/O signaling on the SDMMC bus.
+	  Falls back to DDR52 or HS52 if HS200 fails.
+
 config SDMMC_STM32_CLOCK_CHECK
 	bool "Runtime SDMMC 48MHz clock check"
 	depends on SDMMC_STM32

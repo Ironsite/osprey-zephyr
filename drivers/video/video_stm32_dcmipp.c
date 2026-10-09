@@ -90,6 +90,19 @@ struct stm32_dcmipp_pipe_data {
 	struct video_buffer *active;
 	enum stm32_dcmipp_state state;
 	bool is_streaming;
+
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+	/* Slice mode state (pipe@0 only) */
+	bool slice_mode_enabled;
+	uint32_t slice_lines;
+	uint32_t slice_size;
+	uint32_t current_slice_idx;
+	uint32_t total_slices;
+	uint8_t *slice_buf[2];
+	uint8_t active_buf_idx;
+	uint32_t overrun_count;
+	struct k_sem slice_ready_sem;
+#endif
 };
 
 struct stm32_dcmipp_data {
@@ -144,6 +157,21 @@ struct stm32_dcmipp_config {
 
 #define VIDEO_FMT_PLANAR_Y_PLANE_SIZE(fmt)	((fmt)->width * (fmt)->height)
 
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+/* Slice mode: static DMA buffers sized for max resolution */
+#define DCMIPP_SLICE_MAX_PITCH     5184  /* 2592 × 2 bytes (16-bit unpacked) */
+#define DCMIPP_SLICE_MAX_LINES     CONFIG_VIDEO_STM32_DCMIPP_SLICE_LINES
+#define DCMIPP_SLICE_BUF_SIZE      (DCMIPP_SLICE_MAX_PITCH * DCMIPP_SLICE_MAX_LINES)
+
+static uint8_t __aligned(64) slice_buffer_a[DCMIPP_SLICE_BUF_SIZE]
+	Z_GENERIC_SECTION("PSRAM.bss");
+static uint8_t __aligned(64) slice_buffer_b[DCMIPP_SLICE_BUF_SIZE]
+	Z_GENERIC_SECTION("PSRAM.bss");
+
+static int stm32_dcmipp_enable_slice_mode(struct stm32_dcmipp_pipe_data *pipe,
+					  uint32_t slice_lines);
+#endif /* CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE */
+
 static void stm32_dcmipp_set_next_buffer_addr(struct stm32_dcmipp_pipe_data *pipe)
 {
 	struct stm32_dcmipp_data *dcmipp = pipe->dcmipp;
@@ -185,6 +213,29 @@ static void stm32_dcmipp_set_next_buffer_addr(struct stm32_dcmipp_pipe_data *pip
 #endif
 }
 
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+/* Callback for slice mode: fires every N lines (repeating multiline event).
+ * The DMA writes linearly through the frame buffer — we just track progress.
+ * No address swapping needed; the DMA auto-advances through memory.
+ */
+void HAL_DCMIPP_PIPE_LineEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t Pipe)
+{
+	struct stm32_dcmipp_data *dcmipp =
+			CONTAINER_OF(hdcmipp, struct stm32_dcmipp_data, hdcmipp);
+	struct stm32_dcmipp_pipe_data *pipe = dcmipp->pipe[Pipe];
+
+	if (!pipe->slice_mode_enabled) {
+		return;
+	}
+
+	/* Increment slice counter */
+	pipe->current_slice_idx++;
+
+	/* Signal that another slice worth of data is ready in the frame buffer */
+	k_sem_give(&pipe->slice_ready_sem);
+}
+#endif
+
 /* Callback getting called for each frame written into memory */
 void HAL_DCMIPP_PIPE_FrameEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t Pipe)
 {
@@ -194,7 +245,23 @@ void HAL_DCMIPP_PIPE_FrameEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
 	HAL_StatusTypeDef hal_ret;
 	uint32_t bytesused;
 
-	__ASSERT(pipe->active, "Unexpected behavior, active_buf must not be NULL");
+	/*
+	 * A frame can complete with no buffer attached, so this must not assert.
+	 *
+	 * When the pipe starves, VsyncEventCallback moves the pipe to
+	 * WAIT_FOR_BUFFER and clears CPTREQ. CPTREQ only takes effect at a frame
+	 * boundary and the pipe runs in MODE_CONTINUOUS, so the frame already in
+	 * flight still completes and raises this callback -- by which point the
+	 * previous invocation has handed `active` back and set it to NULL, and
+	 * every subsequent VSYNC returns early because state != RUNNING, so
+	 * nothing reloads it. There is simply no buffer to report; drop the event.
+	 *
+	 * Asserting here panics from interrupt context, and with CONFIG_ASSERT=n
+	 * it degrades into a NULL dereference at pipe->active->bytesused instead.
+	 */
+	if (pipe->active == NULL) {
+		return;
+	}
 
 	/* Counter is only available on Pipe0 */
 	if (Pipe == DCMIPP_PIPE0) {
@@ -231,6 +298,14 @@ void HAL_DCMIPP_PIPE_VsyncEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
 	stm32_dcmipp_isp_vsync_update(hdcmipp, Pipe);
 #endif
 
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+	/* In slice mode, reset slice counter at frame boundary */
+	if (pipe->slice_mode_enabled) {
+		pipe->current_slice_idx = 0;
+		/* Fall through to normal vsync handling (buffer swap) */
+	}
+#endif
+
 	if (pipe->state != STM32_DCMIPP_RUNNING) {
 		return;
 	}
@@ -239,7 +314,7 @@ void HAL_DCMIPP_PIPE_VsyncEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
 
 	pipe->next = k_fifo_get(&pipe->fifo_in, K_NO_WAIT);
 	if (pipe->next == NULL) {
-		LOG_DBG("No buffer available, pause streaming");
+		LOG_WRN("pipe%u: STARVED at vsync, clearing CPTREQ", (unsigned int)Pipe);
 		/*
 		 * Disable Capture Request
 		 * Use direct register access here since we don't want to wait until
@@ -417,7 +492,66 @@ static int stm32_dcmipp_conf_csi(const struct device *dev, uint32_t dcmipp_csi_b
 		return -EIO;
 	}
 
-	phy_bitrate /= MHZ(1);
+	/*
+	 * LINK FREQUENCY -> BITRATE. video_get_csi_link_freq() returns a link
+	 * frequency, but stm32_dcmipp_bitrate[] is a table of BITRATES -- the
+	 * HAL documents DCMIPP_CSI_PHY_BT_750 as "PHY BitRate 750". D-PHY is DDR,
+	 * so the bitrate is twice the link frequency.
+	 *
+	 * Without this the receiver's hsfreqrange, and therefore its HS-SETTLE
+	 * window, is programmed for half the rate actually on the wire. The
+	 * sensor's LP->HS intervals then look too short to the receiver, which
+	 * intermittently misses start-of-transmission and drops whole lines --
+	 * measured on OS05E10 as the whole scene squeezed 2:1 into 972 of 1944
+	 * rows, with ESOTSYNCDL0F/DL1F set in CSI_SR1.
+	 *
+	 * EVIDENCE. Those SoT-sync bits were set in 6 of 6 runs before this
+	 * change and clear after it, at the sensor's own default D-PHY band --
+	 * the failure mechanism appears and disappears with this one line. 36 of
+	 * 36 pipe0 frames come back whole afterwards, against 3-4 of 12 before,
+	 * each frame confirmed distinct by its ~200 ms arrival gap. The contract
+	 * is corroborated independently by video_st_mipid02.c, which derives its
+	 * UI field as 2000000000 / link_freq -- only correct if the bitrate is
+	 * twice the link frequency.
+	 *
+	 * ---- NOT YET VERIFIED, treat with suspicion ----
+	 *
+	 * 1. The other OS05E10 modes have now been swept, each measured with and
+	 *    without this change so the difference is attributable. No mode
+	 *    regressed; the one that moved, improved:
+	 *
+	 *      2592x1944 linear  1452 Mbps -> BT_1500   3-4 of 12 -> 12/12 full
+	 *      1920x1080 linear  1440 Mbps -> BT_1450   0 of 12   -> stable but
+	 *                          still capped at ~745 of 1080 rows, and without
+	 *                          this change it was halving on top of that
+	 *                          (372/744/924 rows, byte counts jumping). 1080p
+	 *                          has a SECOND fault, unrelated to this one.
+	 *      1280x720 bin2x     726 Mbps -> BT_750    no frame either way --
+	 *                          already broken on 2 lanes before this, which
+	 *                          matches its own Kconfig help: 1793 Mbps line
+	 *                          rate against 1452 available.
+	 *      640x480 bin4x      738 Mbps -> BT_750    12/12 full, 614400 bytes
+	 *                          exactly (640*480*2).
+	 *
+	 *    TODO: 2592x1944 DCG is still untested, and so is the other board
+	 *    (osprey_custom_eth), which shares this patch and was working before.
+	 *
+	 * 2. The wire rate is DEDUCED, not measured. 1452 Mbps/lane comes from a
+	 *    bandwidth argument -- 12960 bits/lane fits the 14.28 us line period
+	 *    at 1452 but not at 726 -- and not from a scope on the lanes. If the
+	 *    real rate differs, this may be a better band rather than the right
+	 *    one.
+	 *
+	 * 3. The mechanism is confirmed but not complete. Forcing the sensor's
+	 *    band to its 726 Mbps setting was predicted to DEGRADE once the
+	 *    receiver was corrected, on the theory that it had been matching the
+	 *    mis-set receiver. It did not degrade: both bands give 12/12 full
+	 *    frames now. Why is unexplained.
+	 *
+	 * 4. One board, one mode, one temperature, about an hour of runtime. No
+	 *    soak and no thermal margin testing.
+	 */
+	phy_bitrate = phy_bitrate * 2 / MHZ(1);
 
 	for (i = 0; i < ARRAY_SIZE(stm32_dcmipp_bitrate); i++) {
 		if (stm32_dcmipp_bitrate[i].rate >= phy_bitrate) {
@@ -429,6 +563,10 @@ static int stm32_dcmipp_conf_csi(const struct device *dev, uint32_t dcmipp_csi_b
 		return -EINVAL;
 	}
 	csiconf.PHYBitrate = stm32_dcmipp_bitrate[i].PHYBitrate;
+
+	LOG_INF("CSI PHY: %lld Mbps/lane on the wire -> table entry %u Mbps "
+		"(hsfreqrange index %u)", phy_bitrate, stm32_dcmipp_bitrate[i].rate,
+		stm32_dcmipp_bitrate[i].PHYBitrate);
 
 	hal_ret = HAL_DCMIPP_CSI_SetConfig(&dcmipp->hdcmipp, &csiconf);
 	if (hal_ret != HAL_OK) {
@@ -463,10 +601,10 @@ static int stm32_dcmipp_conf_csi(const struct device *dev, uint32_t dcmipp_csi_b
 	DUMP_PIPE_FMT(SRGGB##size, SRGGB##size)
 
 #define RAW_BAYER_PACKED(size)					\
-	DUMP_PIPE_FMT(SBGGR##size##P, SBGGR##size),		\
-	DUMP_PIPE_FMT(SGBRG##size##P, SGBRG##size),		\
-	DUMP_PIPE_FMT(SGRBG##size##P, SGRBG##size),		\
-	DUMP_PIPE_FMT(SRGGB##size##P, SRGGB##size)
+	DUMP_PIPE_FMT(SBGGR##size##P, SBGGR##size##P),		\
+	DUMP_PIPE_FMT(SGBRG##size##P, SGBRG##size##P),		\
+	DUMP_PIPE_FMT(SGRBG##size##P, SGRBG##size##P),		\
+	DUMP_PIPE_FMT(SRGGB##size##P, SRGGB##size##P)
 
 #if defined(STM32_DCMIPP_HAS_PIXEL_PIPES)
 /* Description of Pixel Pipes formats */
@@ -534,6 +672,15 @@ static const struct stm32_dcmipp_mapping *stm32_dcmipp_get_mapping(uint32_t pixe
 static inline void stm32_dcmipp_compute_fmt_pitch(uint32_t pipe_id, struct video_format *fmt)
 {
 	fmt->pitch = fmt->width * video_bits_per_pixel(fmt->pixelformat) / BITS_PER_BYTE;
+
+	/* The DCMIPP dump pipe (pipe@0) outputs RAW10/12/14 as 16-bit unpacked
+	 * (2 bytes per pixel), not MIPI packed. Override pitch for these formats.
+	 */
+	if (pipe_id == DCMIPP_PIPE0 && video_bits_per_pixel(fmt->pixelformat) > 8 &&
+	    video_bits_per_pixel(fmt->pixelformat) <= 16) {
+		fmt->pitch = fmt->width * 2;  /* 16-bit LE per pixel */
+	}
+
 #if defined(STM32_DCMIPP_HAS_PIXEL_PIPES)
 	if (pipe_id == DCMIPP_PIPE1 || pipe_id == DCMIPP_PIPE2) {
 		/* On Pipe1 and Pipe2, the pitch must be multiple of 16 bytes */
@@ -612,6 +759,17 @@ static int stm32_dcmipp_set_fmt(const struct device *dev, struct video_format *f
 #endif
 
 	pipe->fmt = *fmt;
+
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+	/* Auto-enable slice mode after format is set on pipe@0 */
+	if (pipe->id == DCMIPP_PIPE0 && !pipe->slice_mode_enabled) {
+		int slice_ret = stm32_dcmipp_enable_slice_mode(pipe,
+					CONFIG_VIDEO_STM32_DCMIPP_SLICE_LINES);
+		if (slice_ret) {
+			LOG_WRN("Slice mode enable failed: %d", slice_ret);
+		}
+	}
+#endif
 
 out:
 	k_mutex_unlock(&pipe->lock);
@@ -963,6 +1121,54 @@ static int stm32_dcmipp_start_pipeline(const struct device *dev,
 	return 0;
 }
 
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+static int stm32_dcmipp_enable_slice_mode(struct stm32_dcmipp_pipe_data *pipe,
+					  uint32_t slice_lines)
+{
+	if (pipe->id != DCMIPP_PIPE0) {
+		LOG_ERR("Slice mode only supported on pipe@0");
+		return -ENOTSUP;
+	}
+
+	if (slice_lines == 0 || slice_lines > 128) {
+		LOG_ERR("Invalid slice_lines %u", slice_lines);
+		return -EINVAL;
+	}
+
+	if (pipe->is_streaming) {
+		return -EBUSY;
+	}
+
+	uint32_t pitch = pipe->fmt.pitch;
+	if (pitch == 0) {
+		LOG_ERR("Format pitch is 0");
+		return -EINVAL;
+	}
+
+	pipe->slice_lines = slice_lines;
+	pipe->slice_size = pitch * slice_lines;
+	pipe->total_slices = (pipe->fmt.height + slice_lines - 1) / slice_lines;
+
+	if (pipe->slice_size > DCMIPP_SLICE_BUF_SIZE) {
+		LOG_ERR("Slice size %u exceeds buffer %u", pipe->slice_size, DCMIPP_SLICE_BUF_SIZE);
+		return -ENOMEM;
+	}
+
+	pipe->slice_buf[0] = slice_buffer_a;
+	pipe->slice_buf[1] = slice_buffer_b;
+	pipe->active_buf_idx = 0;
+	pipe->current_slice_idx = 0;
+	pipe->overrun_count = 0;
+	k_sem_init(&pipe->slice_ready_sem, 0, 1);
+	pipe->slice_mode_enabled = true;
+
+	LOG_INF("Slice mode: %u lines/slice, %u bytes/slice, %u slices/frame",
+		pipe->slice_lines, pipe->slice_size, pipe->total_slices);
+
+	return 0;
+}
+#endif /* CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE */
+
 static int stm32_dcmipp_stream_enable(const struct device *dev)
 {
 	struct stm32_dcmipp_pipe_data *pipe = dev->data;
@@ -1019,12 +1225,18 @@ static int stm32_dcmipp_stream_enable(const struct device *dev)
 	}
 
 	pipe->active = NULL;
+
 	pipe->next = k_fifo_get(&pipe->fifo_in, K_NO_WAIT);
 	if (pipe->next == NULL) {
 		LOG_ERR("No buffer available to start streaming");
 		ret = -ENOMEM;
 		goto out;
 	}
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+	if (pipe->slice_mode_enabled) {
+		pipe->current_slice_idx = 0;
+	}
+#endif
 
 #if defined(STM32_DCMIPP_HAS_CSI)
 	/* Configure the Pipe input */
@@ -1071,8 +1283,27 @@ static int stm32_dcmipp_stream_enable(const struct device *dev)
 
 		/* Only the PIPE0 has a limiter */
 		/* Set Limiter to avoid buffer overflow, in number of 32 bits words */
-		hal_ret = HAL_DCMIPP_PIPE_EnableLimitEvent(&dcmipp->hdcmipp, DCMIPP_PIPE0,
-							   (fmt->pitch * fmt->height) / 4);
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+		if (pipe->slice_mode_enabled) {
+			/* Slice mode: use LineEvent (repeating every N lines).
+			 * The ISR swaps the DMA address between double buffers.
+			 * No LimitEvent needed — LineEvent is repeating (not one-shot).
+			 * No LineWrapping — only available on pipe1/pipe2.
+			 */
+			hal_ret = HAL_DCMIPP_PIPE_EnableLineEvent(&dcmipp->hdcmipp, DCMIPP_PIPE0,
+								  DCMIPP_MULTILINE_64_LINES);
+			if (hal_ret != HAL_OK) {
+				LOG_ERR("Failed to enable line event");
+				ret = -EIO;
+				goto out;
+			}
+			LOG_INF("Slice mode: LineEvent every %u lines", pipe->slice_lines);
+		} else
+#endif
+		{
+			hal_ret = HAL_DCMIPP_PIPE_EnableLimitEvent(&dcmipp->hdcmipp, DCMIPP_PIPE0,
+								   (fmt->pitch * fmt->height) / 4);
+		}
 		if (hal_ret != HAL_OK) {
 			LOG_ERR("Failed to set limiter");
 			ret = -EIO;
@@ -1298,12 +1529,20 @@ static int stm32_dcmipp_enqueue(const struct device *dev, struct video_buffer *v
 
 	k_mutex_lock(&pipe->lock, K_FOREVER);
 
-	if (pipe->fmt.pitch * pipe->fmt.height > vbuf->size) {
-		return -EINVAL;
+	/* In slice mode, skip the size check (buffer is full-frame sized) */
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+	if (!pipe->slice_mode_enabled)
+#endif
+	{
+		if (pipe->fmt.pitch * pipe->fmt.height > vbuf->size) {
+			k_mutex_unlock(&pipe->lock);
+			return -EINVAL;
+		}
 	}
 
 	if (pipe->state == STM32_DCMIPP_WAIT_FOR_BUFFER) {
 		LOG_DBG("Restart CPTREQ after wait for buffer");
+		LOG_WRN("pipe%u: MID-FRAME RESTART after starve", (unsigned int)pipe->id);
 		pipe->next = vbuf;
 		stm32_dcmipp_set_next_buffer_addr(pipe);
 		if (pipe->id == DCMIPP_PIPE0) {
@@ -1333,6 +1572,12 @@ static int stm32_dcmipp_dequeue(const struct device *dev, struct video_buffer **
 				k_timeout_t timeout)
 {
 	struct stm32_dcmipp_pipe_data *pipe = dev->data;
+
+#if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
+	/* In slice mode, frames complete normally via FrameEventCallback.
+	 * Just use the standard fifo_out path.
+	 */
+#endif
 
 	*vbuf = k_fifo_get(&pipe->fifo_out, timeout);
 	if (*vbuf == NULL) {

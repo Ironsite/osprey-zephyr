@@ -452,6 +452,236 @@ static int stm32_sdmmc_access_init(struct disk_info *disk)
 		}
 	}
 
+#ifdef CONFIG_SDMMC_STM32_EMMC
+	/*
+	 * Switch eMMC to high-speed mode. Priority order:
+	 *   1. HS200 @ 1.8V (up to 200 MHz, SDR, requires tuning)
+	 *   2. DDR52 (up to 52 MHz clock, DDR = effective 104 MB/s)
+	 *   3. HS52 SDR (up to 52 MHz)
+	 *   4. Default (up to 26 MHz)
+	 */
+	{
+		uint32_t sdmmc_clk = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SDMMC12);
+		uint32_t device_type = (priv->hsd.Ext_CSD[49] & 0x000000FFU);
+		bool hs200_supported = (device_type & 0x10U) != 0U; /* Bit 4 = HS200 @ 1.8V */
+		bool ddr_supported = (device_type & 0x04U) != 0U;   /* Bit 2 = DDR 52 MHz */
+		bool wide_bus = (SDMMC_BUS_WIDTH != SDMMC_BUS_WIDE_1B);
+		bool hs200_enabled = false;
+
+		LOG_INF("eMMC DEVICE_TYPE=0x%02x, HS200=%d, DDR=%d, wide=%d, clk=%u MHz",
+			device_type, hs200_supported, ddr_supported, wide_bus,
+			sdmmc_clk / 1000000U);
+
+#ifdef CONFIG_SDMMC_STM32_HS200
+		/*
+		 * Try HS200 mode first if supported and wide bus is configured.
+		 * HS200 sequence:
+		 * 1. Set bus width to 4/8 bit (already done)
+		 * 2. Send CMD6 to set HS_TIMING=2 (HS200 mode)
+		 * 3. Increase clock frequency
+		 * 4. Execute tuning (CMD21) - TODO for 200 MHz
+		 */
+		if (hs200_supported && wide_bus) {
+			SDMMC_CmdInitTypeDef cmd = {0};
+			uint32_t response;
+			uint32_t count;
+			uint32_t sta;
+			uint32_t timeout;
+
+			LOG_INF("Attempting HS200 mode");
+
+			/* Send CMD6 to switch HS_TIMING to HS200
+			 * Index 185 (0xB9) = HS_TIMING, value 2 = HS200
+			 * Argument format: 0x03B90200
+			 */
+			cmd.Argument = 0x03B90200U;
+			cmd.CmdIndex = 6; /* SWITCH command */
+			cmd.Response = SDMMC_RESPONSE_SHORT;
+			cmd.WaitForInterrupt = SDMMC_WAIT_NO;
+			cmd.CPSM = SDMMC_CPSM_ENABLE;
+
+			if (SDMMC_SendCommand(priv->hsd.Instance, &cmd) == HAL_OK) {
+				timeout = 5000;
+				do {
+					sta = priv->hsd.Instance->STA;
+					timeout--;
+				} while (((sta & (SDMMC_FLAG_CCRCFAIL | SDMMC_FLAG_CMDREND |
+						  SDMMC_FLAG_CTIMEOUT)) == 0U) && (timeout > 0));
+
+				priv->hsd.Instance->ICR = SDMMC_STATIC_CMD_FLAGS;
+
+				if ((sta & SDMMC_FLAG_CMDREND) != 0U) {
+					/* Wait for card ready via CMD13 polling */
+					count = 10000;
+					do {
+						SDMMC_CmdInitTypeDef status_cmd = {0};
+						status_cmd.Argument = (uint32_t)priv->hsd.MmcCard.RelCardAdd << 16;
+						status_cmd.CmdIndex = 13;
+						status_cmd.Response = SDMMC_RESPONSE_SHORT;
+						status_cmd.WaitForInterrupt = SDMMC_WAIT_NO;
+						status_cmd.CPSM = SDMMC_CPSM_ENABLE;
+						SDMMC_SendCommand(priv->hsd.Instance, &status_cmd);
+
+						timeout = 5000;
+						do {
+							sta = priv->hsd.Instance->STA;
+							timeout--;
+						} while (((sta & (SDMMC_FLAG_CCRCFAIL | SDMMC_FLAG_CMDREND |
+								  SDMMC_FLAG_CTIMEOUT)) == 0U) && (timeout > 0));
+
+						priv->hsd.Instance->ICR = SDMMC_STATIC_CMD_FLAGS;
+						response = SDMMC_GetResponse(priv->hsd.Instance, SDMMC_RESP1);
+						count--;
+					} while (((response & 0x100U) == 0U) && (count > 0));
+
+					if ((response & 0x80U) == 0U && count > 0) {
+						/* HS_TIMING switch succeeded */
+						LOG_INF("HS200 timing switch OK");
+
+						/* Set clock for HS200
+						 * CLKDIV=0: 200 MHz (needs tuning - fails without it)
+						 * CLKDIV=1: 100 MHz (works without tuning)
+						 */
+						uint32_t clkdiv = 1; /* 100 MHz - stable without tuning */
+
+						MODIFY_REG(priv->hsd.Instance->CLKCR,
+							   SDMMC_CLKCR_CLKDIV, clkdiv);
+						SET_BIT(priv->hsd.Instance->CLKCR, SDMMC_CLKCR_BUSSPEED);
+
+						LOG_INF("HS200 clock: kernel=%u MHz, div=%u, SDMMC_CK=%u MHz",
+							sdmmc_clk / 1000000U, clkdiv,
+							sdmmc_clk / (2U * clkdiv) / 1000000U);
+
+						hs200_enabled = true;
+						LOG_INF("HS200 enabled (tuning skipped): CLKCR=0x%08x",
+							priv->hsd.Instance->CLKCR);
+					} else {
+						LOG_WRN("HS200 timing switch failed (response=0x%08x)", response);
+					}
+				} else {
+					LOG_WRN("HS200 CMD6 failed (STA=0x%08x)", sta);
+				}
+			} else {
+				LOG_WRN("Failed to send HS200 switch command");
+			}
+		}
+#endif /* CONFIG_SDMMC_STM32_HS200 */
+
+		/* Fall back to DDR52 or HS if HS200 didn't work */
+		if (!hs200_enabled) {
+			/* First, enable high-speed mode */
+			hal_ret = HAL_MMC_ConfigSpeedBusOperation(&priv->hsd,
+								  SDMMC_SPEED_MODE_HIGH);
+			if (hal_ret != HAL_OK) {
+				LOG_WRN("HS mode failed (0x%X), using default speed",
+					priv->hsd.ErrorCode);
+				if (sdmmc_clk > 26000000U) {
+					uint32_t clkdiv = (sdmmc_clk / (2U * 26000000U)) + 1U;
+					MODIFY_REG(priv->hsd.Instance->CLKCR,
+						   SDMMC_CLKCR_CLKDIV, clkdiv);
+				}
+			} else if (ddr_supported && wide_bus) {
+				/*
+				 * Enable DDR52 mode manually (HAL bug workaround).
+				 * DDR requires CLKDIV >= 1.
+				 *
+				 * CLKDIV must be derived from the actual kernel clock,
+				 * not hardcoded: SDMMC_CK = sdmmc_clk / (2 * CLKDIV) must
+				 * stay <= 52 MHz (the DDR52 spec ceiling). A hardcoded
+				 * CLKDIV=1 was only safe for the old 48 MHz PLL2 config
+				 * (giving 24 MHz); with PLL2 now at up to 200 MHz for
+				 * HS200, CLKDIV=1 would run the bus at 100 MHz while the
+				 * card is in DDR52 mode -- 2x out of spec, which is
+				 * exactly the kind of overclock that corrupts in-flight
+				 * multi-block writes and can wedge the card until a
+				 * power cycle / reformat.
+				 */
+				SDMMC_CmdInitTypeDef cmd = {0};
+				uint32_t response;
+				uint32_t count;
+				bool is_8bit = (SDMMC_BUS_WIDTH == SDMMC_BUS_WIDE_8B);
+				uint32_t ddr_clkdiv = (sdmmc_clk / (2U * 52000000U)) + 1U;
+
+				LOG_INF("Enabling DDR52 mode (CLKDIV=%u, SDMMC_CK=%u MHz)",
+					ddr_clkdiv, sdmmc_clk / (2U * ddr_clkdiv) / 1000000U);
+
+				MODIFY_REG(priv->hsd.Instance->CLKCR,
+					   SDMMC_CLKCR_CLKDIV, ddr_clkdiv);
+
+				/* CMD6: Index 183 = BUS_WIDTH, value 5/6 = DDR */
+				cmd.Argument = is_8bit ? 0x03B70600U : 0x03B70500U;
+				cmd.CmdIndex = 6;
+				cmd.Response = SDMMC_RESPONSE_SHORT;
+				cmd.WaitForInterrupt = SDMMC_WAIT_NO;
+				cmd.CPSM = SDMMC_CPSM_ENABLE;
+
+				if (SDMMC_SendCommand(priv->hsd.Instance, &cmd) == HAL_OK) {
+					uint32_t sta;
+					uint32_t timeout = 5000;
+
+					do {
+						sta = priv->hsd.Instance->STA;
+						timeout--;
+					} while (((sta & (SDMMC_FLAG_CCRCFAIL | SDMMC_FLAG_CMDREND |
+							  SDMMC_FLAG_CTIMEOUT)) == 0U) && (timeout > 0));
+
+					priv->hsd.Instance->ICR = SDMMC_STATIC_CMD_FLAGS;
+
+					if ((sta & SDMMC_FLAG_CMDREND) != 0U) {
+						count = 10000;
+						do {
+							SDMMC_CmdInitTypeDef status_cmd = {0};
+							status_cmd.Argument = (uint32_t)priv->hsd.MmcCard.RelCardAdd << 16;
+							status_cmd.CmdIndex = 13;
+							status_cmd.Response = SDMMC_RESPONSE_SHORT;
+							status_cmd.WaitForInterrupt = SDMMC_WAIT_NO;
+							status_cmd.CPSM = SDMMC_CPSM_ENABLE;
+							SDMMC_SendCommand(priv->hsd.Instance, &status_cmd);
+
+							timeout = 5000;
+							do {
+								sta = priv->hsd.Instance->STA;
+								timeout--;
+							} while (((sta & (SDMMC_FLAG_CCRCFAIL | SDMMC_FLAG_CMDREND |
+									  SDMMC_FLAG_CTIMEOUT)) == 0U) && (timeout > 0));
+
+							priv->hsd.Instance->ICR = SDMMC_STATIC_CMD_FLAGS;
+							response = SDMMC_GetResponse(priv->hsd.Instance, SDMMC_RESP1);
+							count--;
+						} while (((response & 0x100U) == 0U) && (count > 0));
+
+						if ((response & 0x80U) == 0U && count > 0) {
+							SET_BIT(priv->hsd.Instance->CLKCR, SDMMC_CLKCR_DDR);
+							LOG_INF("DDR52 enabled: CLKCR=0x%08x",
+								priv->hsd.Instance->CLKCR);
+						} else {
+							/*
+							 * DDR switch failed after CLKDIV was already
+							 * raised for it. Fall back to the same
+							 * <=52 MHz-safe divider (NOT 0 -- CLKDIV=0 is
+							 * bypass mode and would run the bus at the
+							 * full undivided kernel clock, which is the
+							 * opposite of a safe fallback).
+							 */
+							LOG_WRN("DDR switch failed (response=0x%08x)", response);
+							MODIFY_REG(priv->hsd.Instance->CLKCR,
+								   SDMMC_CLKCR_CLKDIV, ddr_clkdiv);
+						}
+					} else {
+						LOG_WRN("DDR CMD6 failed (STA=0x%08x)", sta);
+						MODIFY_REG(priv->hsd.Instance->CLKCR,
+							   SDMMC_CLKCR_CLKDIV, ddr_clkdiv);
+					}
+				} else {
+					LOG_WRN("Failed to send DDR switch command");
+					MODIFY_REG(priv->hsd.Instance->CLKCR,
+						   SDMMC_CLKCR_CLKDIV, ddr_clkdiv);
+				}
+			}
+		}
+	}
+#endif /* CONFIG_SDMMC_STM32_EMMC */
+
 #ifdef CONFIG_SDMMC_STM32_HWFC
 	stm32_sdmmc_fc_enable(priv);
 #endif
@@ -1033,7 +1263,23 @@ static struct stm32_sdmmc_priv stm32_sdmmc_priv_1 = {
 #endif
 		.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE,
 		.Init.BusWide = SDMMC_BUS_WIDE_1B,
+		/*
+		 * Enable HWFC during init as well as after. The HAL's polled
+		 * ExtCSD read (CMD8) in HAL_MMC_InitCard() causes RX_OVERRUN
+		 * on boards running XIP from slow external flash, because the
+		 * poll loop cannot keep up with even 400 kHz SDMMC_CK. HWFC
+		 * stalls SDMMC_CK when the FIFO fills, giving software
+		 * unlimited time to drain it. The only cost is a slower
+		 * transfer, which is irrelevant at identify speed.
+		 *
+		 * CONFIG_SDMMC_STM32_HWFC enables HWFC after init, but that's
+		 * too late -- the overrun happens during init.
+		 */
+#ifdef CONFIG_SDMMC_STM32_HWFC
+		.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE,
+#else
 		.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE,
+#endif
 		.Init.ClockDiv = DT_INST_PROP_OR(0, clk_div, 0),
 	},
 #if DT_INST_NODE_HAS_PROP(0, cd_gpios)

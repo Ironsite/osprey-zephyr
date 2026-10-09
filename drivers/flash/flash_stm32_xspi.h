@@ -100,6 +100,10 @@ struct flash_stm32_xspi_config {
 };
 
 struct flash_stm32_xspi_data {
+	/* Set while the part is still in 1-line SPI/STR, before the switch to
+	 * OPI, so SFDP reads use the 1-line command instead of the octal one.
+	 */
+	bool sfdp_force_spi;
 	/* XSPI handle is modifiable ; so part of data struct */
 	XSPI_HandleTypeDef hxspi;
 	struct k_sem sem;

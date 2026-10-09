@@ -45,4 +45,79 @@ config VIDEO_STM32_VENC_HEAP_ZEPHYR_REGION_NAME
 	string "Name of the zephyr memory-region for memory pool"
 	depends on VIDEO_STM32_VENC_HEAP_ZEPHYR_REGION
 
+config VIDEO_STM32_VENC_FRAMERATE
+	int "Frame rate declared to the encoder (fps)"
+	default 30
+	help
+	  Must match the rate frames are actually delivered at. The rate control
+	  budget is bitPerSecond divided by this, so a mismatch scales the
+	  per-picture bit allowance by exactly the ratio: declaring 30 while
+	  capturing at 5 starves every picture to a sixth of its budget. It also
+	  goes into the SPS timing information.
+
+config VIDEO_STM32_VENC_BITRATE
+	int "Target bitrate in bits/second, 0 for constant QP"
+	default 0
+	help
+	  0 keeps the original fixed-QP behaviour, where the bitrate is whatever
+	  the scene happens to cost. Any other value enables picture and
+	  macroblock rate control against that target, which is what you want
+	  when there is a link budget to respect. Range accepted by the encoder
+	  is 10000 to 60000000.
+
+config VIDEO_STM32_VENC_QP
+	int "Initial quantisation parameter"
+	range 0 51
+	default 25
+	help
+	  With rate control off this is THE quality setting and is used for every
+	  picture. With rate control on it is only the starting point.
+
+config VIDEO_STM32_VENC_QP_MIN
+	int "Lowest quantisation parameter rate control may use"
+	range 0 51
+	default 10
+
+config VIDEO_STM32_VENC_QP_MAX
+	int "Highest quantisation parameter rate control may use"
+	range 0 51
+	default 51
+	help
+	  The quality floor. Lowering it stops the controller dumping quality on
+	  a hard scene, at the cost of overshooting the bitrate target.
+
+config VIDEO_STM32_VENC_GOP_LEN
+	int "Distance between intra pictures, in frames"
+	range 1 300
+	default 30
+	help
+	  Also drives where the driver forces an intra picture, so that intra
+	  placement and the rate controller's per-GOP bit budget agree.
+
+config VIDEO_STM32_VENC_INTRA_QP_DELTA
+	int "Intra picture QP offset"
+	range -12 12
+	default -3
+	help
+	  Negative spends extra bits on intra pictures. Since every following
+	  picture predicts from them, a sharper anchor improves the whole GOP.
+
+config VIDEO_STM32_VENC_TRANSFORM_8X8
+	int "High profile 8x8 transform: 0 off, 1 adaptive, 2 always"
+	range 0 2
+	default 0
+	help
+	  0 pins the stream to Main profile. 1 lets the encoder choose per
+	  macroblock, which preserves fine detail noticeably better at a given
+	  bitrate and is the single largest coding-efficiency win available on
+	  this hardware. Requires a High profile capable decoder.
+
+config VIDEO_STM32_VENC_CABAC
+	int "Entropy coder: 0 CAVLC (Baseline), 1 CABAC"
+	range 0 1
+	default 1
+	help
+	  CABAC costs a little encode time and buys roughly 10 percent bitrate at
+	  the same quality.
+
 endif
