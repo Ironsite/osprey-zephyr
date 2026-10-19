@@ -90,6 +90,19 @@ struct stm32_dcmipp_pipe_data {
 	struct video_buffer *active;
 	enum stm32_dcmipp_state state;
 	bool is_streaming;
+	/*
+	 * Set by VsyncEventCallback when fifo_in was empty: the frame now being
+	 * written into `active` will be overwritten by the following one, which
+	 * has been pointed at the same buffer, so FrameEventCallback must drop it
+	 * rather than hand it out. See the note in VsyncEventCallback.
+	 */
+	bool drop_active;
+	uint32_t frames_dropped;
+	/* Diagnostics, read by stm32_dcmipp_debug_dump(). */
+	uint32_t vsync_count;
+	uint32_t frame_count;
+	uint32_t frame_no_active;   /* FRAME with nothing to hand out */
+	uint32_t frame_dropped_cb;  /* FRAME discarded by drop_active */
 
 #if defined(CONFIG_VIDEO_STM32_DCMIPP_SLICE_MODE)
 	/* Slice mode state (pipe@0 only) */
@@ -120,6 +133,11 @@ struct stm32_dcmipp_data {
 #endif
 
 	struct stm32_dcmipp_pipe_data *pipe[STM32_DCMIPP_MAX_PIPE_NB];
+
+	/* CSI-level diagnostics, read by stm32_dcmipp_debug_dump(). */
+	uint32_t csi_sof;        /* start-of-frame events on VC0 */
+	uint32_t csi_eof;        /* end-of-frame events on VC0 */
+	uint32_t csi_lane_err;   /* D-PHY lane error callbacks */
 };
 
 struct stm32_dcmipp_config {
@@ -259,7 +277,22 @@ void HAL_DCMIPP_PIPE_FrameEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
 	 * Asserting here panics from interrupt context, and with CONFIG_ASSERT=n
 	 * it degrades into a NULL dereference at pipe->active->bytesused instead.
 	 */
+	pipe->frame_count++;
 	if (pipe->active == NULL) {
+		pipe->frame_no_active++;
+		return;
+	}
+
+	if (pipe->drop_active) {
+		pipe->frame_dropped_cb++;
+		/*
+		 * RECAPTURED. VsyncEventCallback found no free buffer and aimed
+		 * the next frame at this one, so the frame that just completed
+		 * here is about to be overwritten and cannot be handed out. The
+		 * next VSYNC reloads `active` from `next`, which is this buffer.
+		 */
+		pipe->drop_active = false;
+		pipe->active = NULL;
 		return;
 	}
 
@@ -306,6 +339,7 @@ void HAL_DCMIPP_PIPE_VsyncEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
 	}
 #endif
 
+	pipe->vsync_count++;
 	if (pipe->state != STM32_DCMIPP_RUNNING) {
 		return;
 	}
@@ -313,13 +347,48 @@ void HAL_DCMIPP_PIPE_VsyncEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
 	pipe->active = pipe->next;
 
 	pipe->next = k_fifo_get(&pipe->fifo_in, K_NO_WAIT);
-	if (pipe->next == NULL) {
-		LOG_WRN("pipe%u: STARVED at vsync, clearing CPTREQ", (unsigned int)Pipe);
+	if (pipe->next == NULL && pipe->active != NULL) {
 		/*
-		 * Disable Capture Request
-		 * Use direct register access here since we don't want to wait until
-		 * getting CPTACT down here since we still need to handle other stuff
+		 * NO FREE BUFFER: KEEP CAPTURING, DROP A FRAME. DO NOT STOP.
+		 *
+		 * This used to park the pipe -- clear CPTREQ, WAIT_FOR_BUFFER --
+		 * and have the next enqueue restart it mid-frame. That restart
+		 * path is where the pipe has died for good, repeatedly: with the
+		 * consumer slower than the sensor it ran on EVERY frame, and
+		 * MEASURED on the osprey proto board it stranded a buffer inside
+		 * the driver about once per 37 frames until none were left --
+		 * "no capture after 221 frames" three runs in a row, zero buffers
+		 * lost from the application's point of view, no recovery short of
+		 * a reboot. Patch 0021 closed one race in that path; this removes
+		 * the path.
+		 *
+		 * Instead the frame AFTER this one is aimed at the buffer this one
+		 * is being written into, exactly as the address register would be
+		 * programmed for any next buffer, and the frame completing into it
+		 * is discarded at FrameEventCallback because it is about to be
+		 * overwritten. Capture never stops, CPTREQ is never touched, and
+		 * the only state is one flag. The cost is the same frame the old
+		 * path lost by parking; the V4L2 drivers for this class of
+		 * hardware do the same thing.
 		 */
+		pipe->next = pipe->active;
+		pipe->drop_active = true;
+		pipe->frames_dropped++;
+		if ((pipe->frames_dropped % 100U) == 1U) {
+			LOG_WRN("pipe%u: no free buffer at vsync, recapturing into the active one "
+				"(%u frames dropped so far)",
+				(unsigned int)Pipe, pipe->frames_dropped);
+		}
+	} else if (pipe->next == NULL) {
+		/*
+		 * Nothing at all -- no next and no active. Cannot happen while
+		 * streaming (next is never NULL in RUNNING once the pipe has
+		 * started), so this is the old park-and-restart path kept only as
+		 * the fallback for a state the code above should have made
+		 * unreachable.
+		 */
+		LOG_WRN("pipe%u: STARVED at vsync with no active buffer, clearing CPTREQ",
+			(unsigned int)Pipe);
 		pipe->state = STM32_DCMIPP_WAIT_FOR_BUFFER;
 		if (Pipe == DCMIPP_PIPE0) {
 			stm32_reg_clear_bits(&hdcmipp->Instance->P0FCTCR, DCMIPP_P0FCTCR_CPTREQ);
@@ -336,6 +405,96 @@ void HAL_DCMIPP_PIPE_VsyncEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t 
 
 	/* Update buffer address */
 	stm32_dcmipp_set_next_buffer_addr(pipe);
+}
+
+/*
+ * The HAL's default is a weak no-op, so a pipe overrun -- after which the HAL
+ * disables the overrun interrupt and marks the pipe HAL_DCMIPP_PIPE_STATE_ERROR
+ * -- used to be invisible. Say so.
+ */
+void HAL_DCMIPP_PIPE_ErrorCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t Pipe)
+{
+	LOG_ERR("pipe%u: HAL error callback, ErrorCode 0x%08x, PipeState %u",
+		(unsigned int)Pipe, (unsigned int)hdcmipp->ErrorCode,
+		(unsigned int)hdcmipp->PipeState[Pipe]);
+}
+
+/*
+ * CSI frame events: the HAL enables SOF/EOF interrupts for the virtual channel
+ * and lands them in weak no-ops. Counting them says whether the SENSOR is still
+ * delivering frames when the pipe has stopped -- the question a "no capture"
+ * stall cannot otherwise answer.
+ */
+void HAL_DCMIPP_CSI_StartOfFrameEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t VirtualChannel)
+{
+	struct stm32_dcmipp_data *dcmipp = CONTAINER_OF(hdcmipp, struct stm32_dcmipp_data, hdcmipp);
+
+	ARG_UNUSED(VirtualChannel);
+	dcmipp->csi_sof++;
+}
+
+void HAL_DCMIPP_CSI_EndOfFrameEventCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t VirtualChannel)
+{
+	struct stm32_dcmipp_data *dcmipp = CONTAINER_OF(hdcmipp, struct stm32_dcmipp_data, hdcmipp);
+
+	ARG_UNUSED(VirtualChannel);
+	dcmipp->csi_eof++;
+}
+
+/*
+ * D-PHY lane errors. The HAL disables the offending interrupt after the FIRST
+ * one and marks the handle HAL_DCMIPP_STATE_ERROR, so each kind is reported at
+ * most once per boot -- which also means this log line cannot flood.
+ */
+void HAL_DCMIPP_CSI_LineErrorCallback(DCMIPP_HandleTypeDef *hdcmipp, uint32_t DataLane)
+{
+	struct stm32_dcmipp_data *dcmipp = CONTAINER_OF(hdcmipp, struct stm32_dcmipp_data, hdcmipp);
+
+	dcmipp->csi_lane_err++;
+	LOG_ERR("CSI D-PHY error on data lane %u: ErrorCode 0x%08x (SOT 0x80000 SOTSYNC 0x40000 "
+		"ESC 0x20000 LPSYNC 0x10000 CTRL 0x8000); that interrupt is now disabled by the HAL",
+		(unsigned int)DataLane, (unsigned int)hdcmipp->ErrorCode);
+}
+
+/*
+ * One-shot state dump for a pipe device, for a shell command in the
+ * application. Everything a "the pipe stopped delivering" investigation needs
+ * and cannot otherwise see: the driver's buffer pointers and fifo state, the
+ * interrupt counters, the HAL's state and error code, and the registers.
+ */
+void stm32_dcmipp_debug_dump(const struct device *dev)
+{
+	struct stm32_dcmipp_pipe_data *pipe = dev->data;
+	struct stm32_dcmipp_data *dcmipp = pipe->dcmipp;
+	DCMIPP_TypeDef *r = dcmipp->hdcmipp.Instance;
+
+	LOG_INF("pipe%u: state %d streaming %d next %p active %p drop_active %d",
+		(unsigned int)pipe->id, pipe->state, pipe->is_streaming, pipe->next, pipe->active,
+		pipe->drop_active);
+	LOG_INF("  fifo_in %s, fifo_out %s; vsync %u, frame %u (no-active %u, dropped-cb %u), "
+		"recaptures %u",
+		k_fifo_is_empty(&pipe->fifo_in) ? "EMPTY" : "has buffers",
+		k_fifo_is_empty(&pipe->fifo_out) ? "empty" : "HAS BUFFERS",
+		pipe->vsync_count, pipe->frame_count, pipe->frame_no_active,
+		pipe->frame_dropped_cb, pipe->frames_dropped);
+	LOG_INF("  HAL PipeState %u ErrorCode 0x%08x; CMSR1 %08x CMSR2 %08x CMIER %08x",
+		(unsigned int)dcmipp->hdcmipp.PipeState[pipe->id],
+		(unsigned int)dcmipp->hdcmipp.ErrorCode, (unsigned int)r->CMSR1,
+		(unsigned int)r->CMSR2, (unsigned int)r->CMIER);
+#if defined(STM32_DCMIPP_HAS_CSI)
+	LOG_INF("  CSI: sof %u eof %u lane-errs %u; SR0 %08x SR1 %08x ERR1 %08x ERR2 %08x HAL state %u",
+		dcmipp->csi_sof, dcmipp->csi_eof, dcmipp->csi_lane_err, (unsigned int)CSI->SR0,
+		(unsigned int)CSI->SR1, (unsigned int)CSI->ERR1, (unsigned int)CSI->ERR2,
+		(unsigned int)dcmipp->hdcmipp.State);
+#endif
+#if defined(STM32_DCMIPP_HAS_PIXEL_PIPES)
+	if (pipe->id == DCMIPP_PIPE1) {
+		LOG_INF("  P1FCTCR %08x (CPTREQ %u) P1FSCR %08x P1PPM0AR1 %08x",
+			(unsigned int)r->P1FCTCR,
+			(unsigned int)((r->P1FCTCR & DCMIPP_P1FCTCR_CPTREQ) ? 1 : 0),
+			(unsigned int)r->P1FSCR, (unsigned int)r->P1PPM0AR1);
+	}
+#endif
 }
 
 #if defined(STM32_DCMIPP_HAS_CSI)
@@ -1225,6 +1384,7 @@ static int stm32_dcmipp_stream_enable(const struct device *dev)
 	}
 
 	pipe->active = NULL;
+	pipe->drop_active = false;
 
 	pipe->next = k_fifo_get(&pipe->fifo_in, K_NO_WAIT);
 	if (pipe->next == NULL) {
@@ -1493,13 +1653,17 @@ static int stm32_dcmipp_stream_disable(const struct device *dev)
 		}
 	}
 
-	/* Release the video buffer allocated when start streaming */
-	if (pipe->next != NULL) {
+	/* Release the video buffer allocated when start streaming. `next` and
+	 * `active` alias while a frame is being recaptured (see
+	 * VsyncEventCallback); a buffer in two fifos at once corrupts both.
+	 */
+	if (pipe->next != NULL && pipe->next != pipe->active) {
 		k_fifo_put(&pipe->fifo_in, pipe->next);
 	}
 	if (pipe->active != NULL) {
 		k_fifo_put(&pipe->fifo_in, pipe->active);
 	}
+	pipe->drop_active = false;
 
 	/* Forward all buffers in fifo_in to fifo_out */
 	while ((vbuf = k_fifo_get(&pipe->fifo_in, K_NO_WAIT)) != NULL) {
@@ -1526,6 +1690,7 @@ static int stm32_dcmipp_enqueue(const struct device *dev, struct video_buffer *v
 {
 	struct stm32_dcmipp_pipe_data *pipe = dev->data;
 	struct stm32_dcmipp_data *dcmipp = pipe->dcmipp;
+	unsigned int key;
 
 	k_mutex_lock(&pipe->lock, K_FOREVER);
 
@@ -1539,6 +1704,44 @@ static int stm32_dcmipp_enqueue(const struct device *dev, struct video_buffer *v
 			return -EINVAL;
 		}
 	}
+
+	/*
+	 * TEST THE STATE AND ACT ON IT WITH INTERRUPTS OFF.
+	 *
+	 * pipe->lock is a k_mutex and does not exclude an interrupt.
+	 * HAL_DCMIPP_PIPE_VsyncEventCallback runs in ISR context, takes no lock
+	 * at all, and writes both pipe->state and pipe->next -- so without this
+	 * the test below races the starve path and the pipe stops for good:
+	 *
+	 *   thread                              vsync ISR
+	 *   ------                              ---------
+	 *   read state -> RUNNING
+	 *   (take the else branch)
+	 *                                       next = k_fifo_get(fifo_in) -> NULL
+	 *                                       state = WAIT_FOR_BUFFER
+	 *                                       clear CPTREQ
+	 *   k_fifo_put(fifo_in, vbuf)
+	 *
+	 * The buffer lands in fifo_in AFTER the pipe has already parked, and the
+	 * restart below is the ONLY code in this driver that ever sets CPTREQ
+	 * again -- it runs on the NEXT enqueue. For a capture loop that returns a
+	 * buffer only after receiving one, that next enqueue never comes: the
+	 * application blocks in video_dequeue() forever while every buffer sits
+	 * unused in fifo_in. The restart is gated behind the thing it restarts.
+	 *
+	 * MEASURED on the osprey proto board: the pipe stops dead after an
+	 * unpredictable number of frames -- 162, 336, 3983 and 7240 observed --
+	 * with "no capture after N frames" every 3 s thereafter, zero buffers
+	 * lost, and no recovery short of a reboot. Every starve event is an
+	 * independent chance to hit the window, so reducing starvation makes this
+	 * rarer and never removes it.
+	 *
+	 * irq_lock() closes the window: either the ISR sees the buffer already in
+	 * fifo_in, or this sees WAIT_FOR_BUFFER and restarts. No third outcome.
+	 * k_fifo_put() is ISR-safe and does not block, so it is safe here; any
+	 * reschedule it causes is deferred to irq_unlock().
+	 */
+	key = irq_lock();
 
 	if (pipe->state == STM32_DCMIPP_WAIT_FOR_BUFFER) {
 		LOG_DBG("Restart CPTREQ after wait for buffer");
@@ -1562,6 +1765,8 @@ static int stm32_dcmipp_enqueue(const struct device *dev, struct video_buffer *v
 	} else {
 		k_fifo_put(&pipe->fifo_in, vbuf);
 	}
+
+	irq_unlock(key);
 
 	k_mutex_unlock(&pipe->lock);
 

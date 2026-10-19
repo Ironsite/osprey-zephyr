@@ -1752,6 +1752,7 @@ static int setup_pages_layout(const struct device *dev)
 	const size_t flash_size = dev_cfg->flash_size;
 	uint32_t layout_page_size = data->page_size;
 	uint8_t value = 0;
+	bool found = false;
 	int rv = 0;
 
 	/* Find the smallest erase size. */
@@ -1759,16 +1760,23 @@ static int setup_pages_layout(const struct device *dev)
 		const struct jesd216_erase_type *etp = &data->erase_types[i];
 
 		if ((etp->cmd != 0)
-		    && ((value == 0) || (etp->exp < value))) {
+		    && (!found || (etp->exp < value))) {
 			value = etp->exp;
+			found = true;
 		}
 	}
 
-	uint32_t erase_size = BIT(value);
-
-	if (erase_size == 0) {
-		erase_size = SPI_NOR_SECTOR_SIZE;
-	}
+	/*
+	 * erase_size used to be computed as BIT(value) with a fallback to
+	 * SPI_NOR_SECTOR_SIZE when erase_size == 0 -- but BIT(x) is never 0,
+	 * so that fallback was unreachable. If every erase_types[] entry has
+	 * cmd == 0 (SFDP genuinely provided none, e.g. all were cleared by
+	 * the 4-byte-address-instruction table for a chip with no 4-byte
+	 * erase opcodes), value silently stayed 0 and erase_size became
+	 * BIT(0) = 1 byte instead of falling back. See the identical fix
+	 * and full explanation in flash_stm32_xspi.c's setup_pages_layout().
+	 */
+	uint32_t erase_size = found ? BIT(value) : SPI_NOR_SECTOR_SIZE;
 
 	/* We need layout page size to be compatible with erase size */
 	if ((layout_page_size % erase_size) != 0) {
@@ -2202,6 +2210,21 @@ static int flash_stm32_ospi_init(const struct device *dev)
 		LOG_DBG("NOR init'd in MemMapped mode");
 		/* Force HAL instance in correct state */
 		dev_data->hospi.State = HAL_OSPI_STATE_BUSY_MEM_MAPPED;
+
+		/*
+		 * BUG (fixed): see the identical fix + full explanation in
+		 * flash_stm32_xspi.c's flash_stm32_xspi_init(). This early
+		 * return used to skip dev_data->sem/sync initialization,
+		 * leaving them all-zero (.bss) for the lifetime of the
+		 * device -- a NULL wait-queue head that faults the first
+		 * time xspi_lock_thread()'s OSPI equivalent takes real
+		 * contention (e.g. the first mcumgr image-upload flash_erase
+		 * call on a device that booted via XIP from this same
+		 * memory-mapped flash).
+		 */
+		k_sem_init(&dev_data->sem, 1, 1);
+		k_sem_init(&dev_data->sync, 0, 1);
+
 		return 0;
 	}
 #endif /* CONFIG_STM32_MEMMAP */

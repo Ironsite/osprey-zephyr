@@ -576,6 +576,32 @@ void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *heth)
 	eth_stm32_update_rx_error_details(heth, dev_data);
 
 #endif /* CONFIG_NET_STATISTICS_ETHERNET */
+
+#if defined(ETH_DMACSR_FBE)
+#define ETH_STM32_DMA_FBE ETH_DMACSR_FBE
+#elif defined(ETH_DMACxSR_FBE)
+/* STM32N6: per-channel DMA status registers, same Fatal Bus Error bit. */
+#define ETH_STM32_DMA_FBE ETH_DMACxSR_FBE
+#endif
+
+#if defined(HAL_ETH_ERROR_MAC) && defined(ETH_STM32_DMA_FBE)
+	/* A MAC RX/TX status interrupt (no carrier, loss of carrier,
+	 * collisions, jabber, receive watchdog) makes the HAL set gState to
+	 * HAL_ETH_STATE_ERROR, although these are per-frame conditions and the
+	 * MAC and DMA keep running. Nothing ever clears that state:
+	 * HAL_ETH_Transmit_IT() requires STARTED, and HAL_ETH_Stop_IT()/Start_IT()
+	 * refuse to run from ERROR, so even the link-change restart cannot
+	 * recover it. Seen when a 100BASE-T1 partner rebooted mid-transmit ("no
+	 * carrier"): "HAL_ETH_Transmit: failed!" once a second until reset.
+	 * Return to STARTED unless the DMA reported a fatal bus error.
+	 */
+	if (((HAL_ETH_GetError(heth) & HAL_ETH_ERROR_MAC) != 0U) &&
+	    (heth->gState == HAL_ETH_STATE_ERROR) &&
+	    ((HAL_ETH_GetDMAError(heth) & ETH_STM32_DMA_FBE) == 0U)) {
+		heth->ErrorCode &= ~HAL_ETH_ERROR_MAC;
+		heth->gState = HAL_ETH_STATE_STARTED;
+	}
+#endif
 }
 
 int eth_stm32_hal_init(const struct device *dev)
@@ -710,6 +736,50 @@ void eth_stm32_setup_mac_filter(ETH_HandleTypeDef *heth)
 	k_sleep(K_MSEC(1));
 }
 
+/* Single-TX-channel HALs only. Multi-channel HALs (STM32N6: TxDescList[] per
+ * channel, per-channel DMA registers) have the same gap but are not
+ * covered here yet.
+ */
+#if !defined(ETH_DMA_TX_CH_CNT) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32mp13_ethernet)
+/*
+ * Return every TX descriptor to the driver and point the DMA back at the
+ * start of the ring. Only valid while the HAL is stopped.
+ *
+ * HAL_ETH_Stop_IT() halts the TX DMA and flushes its FIFO but leaves the TX
+ * descriptor ring as it was, and HAL_ETH_Start_IT() rebuilds only the RX
+ * ring. A frame in flight when the link dropped therefore stays owned by the
+ * DMA, the HAL's CurTxDesc/BuffersInUse no longer match where the DMA is,
+ * and after the restart the DMA sits suspended ("descriptor unavailable")
+ * while every HAL_ETH_Transmit_IT() fails with BUSY. Nothing reclaims it, so
+ * one link drop under traffic (here: the partner rebooting) ends all TX
+ * until reset.
+ */
+static void eth_stm32_tx_ring_reset(ETH_HandleTypeDef *heth)
+{
+	ETH_TxDescListTypeDef *list = &heth->TxDescList;
+
+	for (uint32_t i = 0; i < ETH_TX_DESC_CNT; i++) {
+		ETH_DMADescTypeDef *desc = (ETH_DMADescTypeDef *)list->TxDesc[i];
+
+		if (list->PacketAddress[i] != NULL) {
+			HAL_ETH_TxFreeCallback(STM32_ETH_ARGS(heth, list->PacketAddress[i]));
+			list->PacketAddress[i] = NULL;
+		}
+		desc->DESC0 = 0U;
+		desc->DESC1 = 0U;
+		desc->DESC2 = 0U;
+		desc->DESC3 = 0U;
+	}
+
+	list->CurTxDesc = 0U;
+	list->BuffersInUse = 0U;
+	list->releaseIndex = 0U;
+	list->CurrentPacketAddress = NULL;
+
+	WRITE_REG(heth->Instance->DMACTDLAR, list->TxDesc[0]);
+}
+#endif
+
 int eth_stm32_hal_start(const struct device *dev)
 {
 	struct eth_stm32_hal_dev_data *dev_data = dev->data;
@@ -717,6 +787,12 @@ int eth_stm32_hal_start(const struct device *dev)
 	HAL_StatusTypeDef hal_ret;
 
 	LOG_DBG("Starting ETH HAL driver");
+
+#if !defined(ETH_DMA_TX_CH_CNT) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32mp13_ethernet)
+	if (heth->gState == HAL_ETH_STATE_READY) {
+		eth_stm32_tx_ring_reset(heth);
+	}
+#endif
 
 	hal_ret = HAL_ETH_Start_IT(heth);
 

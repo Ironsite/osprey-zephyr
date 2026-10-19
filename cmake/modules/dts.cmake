@@ -129,6 +129,11 @@ set(VENDOR_PREFIXES             dts/bindings/vendor-prefixes.txt)
 
 # Fetch variable from sysbuild which might be forcing a configuration (for variant build images)
 zephyr_get(DTS_SOURCE SYSBUILD LOCAL)
+# Set by sysbuild only for a variant image. Its DTS_SOURCE is the source
+# image's generated zephyr.dts, which already contains every board, shield
+# and user overlay, so those must not be applied a second time (they also
+# reference macros the preprocessed zephyr.dts no longer defines).
+zephyr_get(KCONFIG_VARIANT_SOURCE SYSBUILD LOCAL)
 
 if(NOT DEFINED DTS_SOURCE)
   zephyr_build_string(board_string SHORT shortened_board_string
@@ -178,13 +183,17 @@ endif()
 
 zephyr_file(CONF_FILES ${BOARD_EXTENSION_DIRS} DTS board_extension_dts_files)
 
-set(dts_files
-  ${DTS_SOURCE}
-  ${board_extension_dts_files}
-  ${shield_dts_files}
-  )
+if(KCONFIG_VARIANT_SOURCE)
+  set(dts_files ${DTS_SOURCE})
+else()
+  set(dts_files
+    ${DTS_SOURCE}
+    ${board_extension_dts_files}
+    ${shield_dts_files}
+    )
+endif()
 
-if(DTC_OVERLAY_FILE)
+if(DTC_OVERLAY_FILE AND NOT KCONFIG_VARIANT_SOURCE)
   zephyr_list(TRANSFORM DTC_OVERLAY_FILE NORMALIZE_PATHS
               OUTPUT_VARIABLE DTC_OVERLAY_FILE_AS_LIST)
   build_info(devicetree user-files PATH ${DTC_OVERLAY_FILE_AS_LIST})
