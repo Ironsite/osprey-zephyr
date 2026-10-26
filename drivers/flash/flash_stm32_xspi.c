@@ -1140,8 +1140,15 @@ static void stm32_xspi_invalidate_mmap_cache(const struct device *dev, off_t add
 	const struct flash_stm32_xspi_config *dev_cfg = dev->config;
 	size_t line_size = sys_cache_data_line_size_get();
 
+	/* Reads go through the memory-mapped window, and so through the data
+	 * cache, with CONFIG_STM32_MEMMAP and also with
+	 * CONFIG_FLASH_STM32_XSPI_RAM_RELOCATION (XIP). Without the invalidate,
+	 * lines cached before an erase or write keep returning the old bytes
+	 * until they are evicted.
+	 */
 	if (line_size != 0 && IS_ENABLED(CONFIG_DCACHE) &&
-	    IS_ENABLED(CONFIG_STM32_MEMMAP) &&
+	    (IS_ENABLED(CONFIG_STM32_MEMMAP) ||
+	     IS_ENABLED(CONFIG_FLASH_STM32_XSPI_RAM_RELOCATION)) &&
 	    IS_ENABLED(CONFIG_CACHE_MANAGEMENT)) {
 		uintptr_t start = ROUND_DOWN(dev_cfg->mem_map_based_address + addr, line_size);
 		uintptr_t end = ROUND_UP(dev_cfg->mem_map_based_address + addr + size, line_size);
@@ -2359,6 +2366,14 @@ static int flash_stm32_xspi_init(const struct device *dev)
 #endif
 			/* Force HAL instance in correct state */
 			dev_data->hxspi.State = HAL_XSPI_STATE_BUSY_MEM_MAPPED;
+
+			/* HAL_XSPI_Init() is bypassed too, and it is what sets the
+			 * handle's timeout. Left at 0, HAL_XSPI_Abort() fails at
+			 * once whenever a memory-mapped read is still in flight as
+			 * an erase or write leaves memory-mapped mode, and the
+			 * erase or write returns -EIO.
+			 */
+			(void)HAL_XSPI_SetTimeout(&dev_data->hxspi, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
 
 			/* Run IRQ init */
 			dev_cfg->irq_config(dev);
